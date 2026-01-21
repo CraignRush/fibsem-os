@@ -4,6 +4,7 @@ Example showing how to embed multiple napari viewers in a tabbed Qt widget.
 This demonstrates embedding AutoLamellaUI and Protocol Editor in separate tabs,
 each with their own napari viewer instance.
 """
+from __future__ import annotations
 
 import sys
 try:
