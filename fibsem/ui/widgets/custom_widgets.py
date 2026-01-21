@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 from enum import Enum
 from typing import Optional, Union
 
@@ -62,6 +63,42 @@ class QFilePathLineEdit(QWidget):
         self.lineEdit.setText(text)
 
 
+def _find_closest_string_match(value: str, items: list) -> any:
+    """Find the closest matching string value from a list of items using fuzzy matching.
+    
+    Args:
+        value: The value to match
+        items: List of items to search through
+        
+    Returns:
+        The closest matching item from the list
+    """
+    if not items:
+        return value
+    
+    str_value = str(value).lower()
+    str_items = [str(item).lower() for item in items]
+    
+    # Try exact match (case-insensitive)
+    for item, str_item in zip(items, str_items):
+        if str_item == str_value:
+            return item
+    
+    # Try fuzzy matching with difflib
+    matches = get_close_matches(str_value, str_items, n=1, cutoff=0.6)
+    if matches:
+        idx = str_items.index(matches[0])
+        return items[idx]
+    
+    # Try substring match (bidirectional)
+    for item, str_item in zip(items, str_items):
+        if str_value in str_item or str_item in str_value:
+            return item
+    
+    # Default to first item
+    return items[0]
+
+
 def _create_combobox_control(value: Union[str, int, float, Enum], 
                              items: list, 
                              units: Optional[str], 
@@ -82,7 +119,7 @@ def _create_combobox_control(value: Union[str, int, float, Enum],
     if isinstance(value, tuple) and len(value) == 2:
         value = list(value)  # Convert tuple to list for easier handling
 
-    # find the closest match to the current value (should only be used for numerical values)
+    # find the closest match to the current value
     idx = control.findData(value)
     if idx == -1:
         # get the closest value
@@ -91,15 +128,8 @@ def _create_combobox_control(value: Union[str, int, float, Enum],
                 # numeric comparison
                 closest_value = min(items, key=lambda x: abs(x - value))
             else:
-                # string comparison - try exact match first, then case-insensitive, then first item
-                str_value = str(value).lower()
-                closest_value = next(
-                    (item for item in items if str(item).lower() == str_value),
-                    next(
-                        (item for item in items if str_value in str(item).lower()),
-                        items[0]
-                    )
-                )
+                # string comparison - use fuzzy matching for better results
+                closest_value = _find_closest_string_match(str(value), items)
         else:
             closest_value = value
         idx = control.findData(closest_value)
