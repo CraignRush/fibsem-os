@@ -86,7 +86,22 @@ def _create_combobox_control(value: Union[str, int, float, Enum],
     idx = control.findData(value)
     if idx == -1:
         # get the closest value
-        closest_value = min(items, key=lambda x: abs(x - value))
+        if items:
+            if isinstance(value, (int, float)) and all(isinstance(x, (int, float)) for x in items):
+                # numeric comparison
+                closest_value = min(items, key=lambda x: abs(x - value))
+            else:
+                # string comparison - try exact match first, then case-insensitive, then first item
+                str_value = str(value).lower()
+                closest_value = next(
+                    (item for item in items if str(item).lower() == str_value),
+                    next(
+                        (item for item in items if str_value in str(item).lower()),
+                        items[0]
+                    )
+                )
+        else:
+            closest_value = value
         idx = control.findData(closest_value)
     if idx == -1:
         logging.debug(f"Warning: No matching item or nearest found for {items} with value {value}. Using first item.")
