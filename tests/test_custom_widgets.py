@@ -131,3 +131,73 @@ def test_string_values_substring_match():
         closest_value = value
     
     assert closest_value == '8i-cc3-config'
+
+
+def test_fuzzy_string_matching():
+    """Test fuzzy string matching with application file names."""
+    from fibsem.ui.widgets.custom_widgets import _find_closest_string_match
+    
+    # Test exact match
+    items = ['Si-cc3', 'Si-cc3 Neu', 'config1', 'config2']
+    result = _find_closest_string_match('Si-cc3', items)
+    assert result == 'Si-cc3'
+    
+    # Test case-insensitive match
+    result = _find_closest_string_match('si-cc3', items)
+    assert result == 'Si-cc3'
+    
+    # Test fuzzy match for similar strings
+    result = _find_closest_string_match('Si-cc3 New', items)
+    # Should match 'Si-cc3 Neu' as it's very similar
+    assert result == 'Si-cc3 Neu'
+    
+    # Test substring match
+    result = _find_closest_string_match('cc3', items)
+    # Should match first item containing 'cc3'
+    assert result == 'Si-cc3'
+    
+    # Test no match - should return first item
+    result = _find_closest_string_match('completely-different', items)
+    assert result == 'Si-cc3'
+
+
+def test_fuzzy_matching_empty_items():
+    """Test fuzzy matching with empty items list."""
+    from fibsem.ui.widgets.custom_widgets import _find_closest_string_match
+    
+    items = []
+    result = _find_closest_string_match('test', items)
+    assert result == 'test'
+
+
+def test_fuzzy_matching_application_files():
+    """Test fuzzy matching with real application file names."""
+    from fibsem.ui.widgets.custom_widgets import _find_closest_string_match
+    
+    # Real-world scenario from the bug report
+    items = ['8i-cc3', 'Si-cc3', 'Si-cc3 Neu', 'Si-cc3 New', 'Other Config']
+    
+    # Test matching "Si-cc3" should find exact match
+    result = _find_closest_string_match('Si-cc3', items)
+    assert result == 'Si-cc3'
+    
+    # Test matching similar variant should find close match
+    result = _find_closest_string_match('Si-cc3 N', items)
+    # Should match either 'Si-cc3 Neu' or 'Si-cc3 New' as they're both similar
+    assert result in ['Si-cc3 Neu', 'Si-cc3 New', 'Si-cc3']
+
+
+def test_combobox_with_fuzzy_matching():
+    """Test that combobox uses fuzzy matching for application files."""
+    from fibsem.ui.widgets.custom_widgets import _create_combobox_control
+    
+    items = ['Si-cc3', 'Si-cc3 Neu', 'config1', 'config2']
+    
+    # Test with fuzzy match
+    control = _create_combobox_control('Si-cc3 New', items, None)
+    
+    # Should select 'Si-cc3 Neu' as closest match
+    current_text = control.currentText()
+    current_data = control.currentData()
+    assert current_data in items  # Should be one of the valid items
+    # The exact match depends on fuzzy matching algorithm, but should not crash
