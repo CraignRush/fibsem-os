@@ -2828,17 +2828,24 @@ class ThermoMicroscope(FibsemMicroscope):
         application_files = self.get_available_values("application_file")
         if application_file not in application_files:
             if strict:
-                raise ValueError(f"Application file {application_file} not available. Available files: {application_files}")
+                raise ValueError(f"Strict Matching: Application file {application_file} not available. Available files: {application_files}")
             from difflib import get_close_matches
             closest_match = get_close_matches(application_file, application_files, n=1)
             if not closest_match:
-                raise ValueError(f"Application file {application_file} not available. Available files: {application_files}")
+                raise ValueError(f"Loose Matching: Application file {application_file} not available. Available files: {application_files}")
+            else:
+                logging.debug(
+                    {
+                        "msg": "get_application_file",
+                        "closest match": closest_match,
+                    }
+                )
             application_file = str(closest_match[0])
 
         return application_file
 
     def set_application_file(
-        self, application_file: str, default: bool = False, strict: bool = True
+        self, application_file: str, default: bool = False, strict: bool = False
     ) -> str:
         """Sets the default application file for the patterning API.
         The api requires setting a valid application file before creating patterns.
@@ -2907,7 +2914,7 @@ class ThermoMicroscope(FibsemMicroscope):
         elif pattern_settings.cross_section is CrossSectionPattern.CleaningCrossSection:
             create_pattern_function = patterning_api.create_cleaning_cross_section
             self.set_patterning_mode("Serial") # parallel mode not supported for cleaning cross section
-            self.set_application_file("Si-ccs", strict=False)
+            self.set_application_file("Si-ccs New", strict=False)
         else:
             create_pattern_function = patterning_api.create_rectangle
 
