@@ -19,22 +19,6 @@ from scipy.ndimage import median_filter, gaussian_filter
 import fibsem
 from fibsem.config import METADATA_VERSION, SUPPORTED_COORDINATE_SYSTEMS
 
-try:
-    sys.path.append(r"C:\Program Files\Thermo Scientific AutoScript")
-    sys.path.append(r"C:\Program Files\Enthought\Python\envs\AutoScript\Lib\site-packages")
-    sys.path.append(r"C:\Program Files\Python36\envs\AutoScript")
-    sys.path.append(r"C:\Program Files\Python36\envs\AutoScript\Lib\site-packages")
-    from autoscript_sdb_microscope_client.enumerations import CoordinateSystem
-    from autoscript_sdb_microscope_client.structures import (
-        AdornedImage,
-        CompustagePosition,
-        ManipulatorPosition,
-        StagePosition,
-    )
-    THERMO_API_AVAILABLE = True
-except ImportError:
-    THERMO_API_AVAILABLE = False
-    # if Thermo imports fail, we assume we are not using Thermo microscope
 
 TFibsemPatternSettings = TypeVar(
     "TFibsemPatternSettings", bound="FibsemPatternSettings"
@@ -167,6 +151,19 @@ class ManipulatorState(Enum):
     MOVING = 2
 
 
+class AutoFocusMode(Enum):
+    NONE = 0
+    ONCE = 1
+    EVERY_ROW = 2
+    EVERY_TILE = 3
+
+
+class TileOrderStrategy(Enum):
+    TYPEWRITER = "typewriter"   # rows always left-to-right
+    SERPENTINE = "serpentine"   # alternating: row 0 L→R, row 1 R→L, ...
+    SPIRAL     = "spiral"       # outward clockwise spiral from centre tile
+
+
 @dataclass
 class FibsemStagePosition:
     """Data class for storing stage position data.
@@ -182,8 +179,7 @@ class FibsemStagePosition:
     Methods:
         to_dict(): Convert the stage position object to a dictionary.
         from_dict(data: dict): Create a new stage position object from a dictionary.
-        to_autoscript_position(compustage: bool) -> StagePosition: Convert the stage position to a StagePosition object that is compatible with Autoscript.
-        from_autoscript_position(position: StagePosition) -> None: Create a new FibsemStagePosition object from a StagePosition object that is compatible with Autoscript.
+        See fibsem.microscopes.autoscript for AutoScript conversion utilities (stage_position_to_autoscript, stage_position_from_autoscript).
     """
 
     name: Optional[str] = None
@@ -224,77 +220,6 @@ class FibsemStagePosition:
             r=data["r"],
             t=data["t"],
             coordinate_system=data["coordinate_system"],
-        )
-
-    def to_autoscript_position(self, compustage: bool = False) -> Union['StagePosition', 'CompustagePosition']:
-        """Converts the stage position to a StagePosition object that is compatible with Autoscript.
-        Args:
-            compustage: bool = False: Whether or not the stage is a compustage.
-        Returns:
-            StagePosition / CompuStagePosition compatible with Autoscript.        
-        Raises:
-            ImportError: If AutoScript libraries are not available.
-        """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert to AutoScript position.")
-
-        # reference: SerialFIB Arctis Driver
-        # https://github.com/sklumpe/SerialFIB/blob/main/src/Arctis/ArctisDriver.py
-        if compustage:
-            stage_position = CompustagePosition(
-                x=self.x,
-                y=self.y,
-                z=self.z,
-                a=self.t,
-                coordinate_system=CoordinateSystem.SPECIMEN,
-            )               
-
-        else:
-            stage_position = StagePosition(
-                x=self.x,
-                y=self.y, 
-                z=self.z,  
-                r=self.r,
-                t=self.t,
-                coordinate_system=CoordinateSystem.RAW,
-            )
-
-        return stage_position
-
-    @classmethod
-    def from_autoscript_position(cls, position: Union['StagePosition', 'CompustagePosition']) -> 'FibsemStagePosition':
-        """Creates FibsemStagePosition from AutoScript position objects.
-        
-        Args:
-            position: AutoScript StagePosition or CompustagePosition object
-            
-        Returns:
-            FibsemStagePosition: Converted position
-            
-        Raises:
-            ImportError: If AutoScript libraries are not available.
-        """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert from AutoScript position.")
-
-        # compustage position
-        if isinstance(position, CompustagePosition):
-            return cls(
-                x=position.x,
-                y=position.y,
-                z=position.z,
-                r=0.0,
-                t=position.a,
-                coordinate_system=CoordinateSystem.SPECIMEN.upper(),
-            )
-
-        return cls(
-            x=position.x,
-            y=position.y,  
-            z=position.z,
-            r=position.r,
-            t=position.t,
-            coordinate_system=position.coordinate_system.upper(),
         )
 
     def __add__(self, other: "FibsemStagePosition") -> "FibsemStagePosition":
@@ -427,8 +352,7 @@ class FibsemManipulatorPosition:
     Methods:
         to_dict(): Convert the manipulator position object to a dictionary.
         from_dict(data: dict): Create a new manipulator position object from a dictionary.
-        to_autoscript_position() -> ManipulatorPosition: Convert the manipulator position to a ManipulatorPosition object that is compatible with Autoscript.
-        from_autoscript_position(position: ManipulatorPosition) -> None: Create a new FibsemManipulatorPosition object from a ManipulatorPosition object that is compatible with Autoscript.
+        See fibsem.microscopes.autoscript for AutoScript conversion utilities (manipulator_position_to_autoscript, manipulator_position_from_autoscript).
         to_tescan_position(): Convert the manipulator position to a format that is compatible with Tescan.
         from_tescan_position(): Create a new FibsemManipulatorPosition object from a Tescan-compatible manipulator position.
     """
@@ -476,54 +400,6 @@ class FibsemManipulatorPosition:
             r=data["r"],
             t=data["t"],
             coordinate_system=data["coordinate_system"],
-        )
-
-    def to_autoscript_position(self) -> 'ManipulatorPosition':
-        """Converts the manipulator position to AutoScript ManipulatorPosition.
-        
-        Returns:
-            ManipulatorPosition: AutoScript compatible position
-            
-        Raises:
-            ImportError: If AutoScript libraries are not available.
-        """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert to AutoScript position.")
-            
-        if self.coordinate_system == "RAW":
-            coordinate_system = "Raw"
-        elif self.coordinate_system == "STAGE":
-            coordinate_system = "Stage"
-        return ManipulatorPosition(
-            x=self.x,
-            y=self.y,
-            z=self.z,
-            r=None,  # TODO figure this out, do we need it for real micrscope or just simulator ?
-            # r=None,
-            coordinate_system=coordinate_system,
-        )
-
-    @classmethod
-    def from_autoscript_position(cls, position: 'ManipulatorPosition') -> 'FibsemManipulatorPosition':
-        """Creates FibsemManipulatorPosition from AutoScript ManipulatorPosition.
-        
-        Args:
-            position: AutoScript ManipulatorPosition object
-            
-        Returns:
-            FibsemManipulatorPosition: Converted position
-            
-        Raises:
-            ImportError: If AutoScript libraries are not available.
-        """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert from AutoScript position.")
-            
-        return cls(
-            x=position.x,
-            y=position.y,
-            z=position.z,
-            coordinate_system=position.coordinate_system.upper(),
         )
 
     def __add__(
@@ -797,39 +673,56 @@ class ImageSettings:
 
         return image_settings
 
-    @staticmethod
-    def fromAdornedImage(image: 'AdornedImage', beam_type: BeamType = BeamType.ELECTRON
-    ) -> 'ImageSettings':
-        """Creates ImageSettings from AutoScript AdornedImage.
-        
-        Args:
-            image: AutoScript AdornedImage object
-            beam_type: Beam type for the image settings
-            
-        Returns:
-            ImageSettings: Converted image settings
-            
-        Raises:
-            ImportError: If AutoScript libraries are not available.
-        """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert from AdornedImage.")
-            
-        from fibsem.utils import current_timestamp
 
-        image_settings = ImageSettings(
-            resolution=(image.width, image.height),
-            dwell_time=image.metadata.scan_settings.dwell_time,
-            hfw=image.width * image.metadata.binary_result.pixel_size.x,
-            autocontrast=True,
-            beam_type=beam_type,
-            autogamma=True,
-            save=False,
-            path="path",
-            filename=current_timestamp(),
-            reduced_area=None,
+@dataclass
+class FocusStackSettings:
+    """Settings for focus-stack acquisition in tiled overview acquisition.
+
+    Attributes:
+        enabled: Whether to use focus stacking for each tile.
+        n_steps: Number of vertical strips to divide each tile into.
+        auto_focus: Whether to run autofocus for each strip.
+    """
+
+    enabled: bool = False
+    n_steps: int = 3
+    auto_focus: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "n_steps": self.n_steps,
+            "auto_focus": self.auto_focus,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "FocusStackSettings":
+        return FocusStackSettings(
+            enabled=d.get("enabled", False),
+            n_steps=d.get("n_steps", 3),
+            auto_focus=d.get("auto_focus", True),
         )
-        return image_settings
+
+
+@dataclass
+class AutoFocusSettings:
+    """Settings for autofocus in tiled overview acquisition.
+
+    Attributes:
+        mode: When to apply autofocus (NONE, ONCE, EVERY_ROW, EVERY_TILE).
+              beam_type and reduced_area are taken from image_settings at acquisition time.
+    """
+
+    mode: AutoFocusMode = AutoFocusMode.NONE
+
+    def to_dict(self) -> dict:
+        return {"mode": self.mode.name}
+
+    @staticmethod
+    def from_dict(d: dict) -> "AutoFocusSettings":
+        return AutoFocusSettings(
+            mode=AutoFocusMode[d.get("mode", "NONE")]
+        )
 
 
 @dataclass
@@ -847,21 +740,46 @@ class OverviewAcquisitionSettings:
     nrows: int = 3
     ncols: int = 3
     overlap: float = 0.0
-    use_focus_stack: bool = False
+    focus_stack_settings: FocusStackSettings = field(default_factory=FocusStackSettings)
+    autofocus_settings: AutoFocusSettings = field(default_factory=AutoFocusSettings)
+    tile_order: TileOrderStrategy = TileOrderStrategy.TYPEWRITER
+
+    @property
+    def total_fov_x(self) -> float:
+        """Total horizontal FOV in meters, accounting for overlap."""
+        hfw = self.image_settings.hfw
+        dx = hfw * (1 - self.overlap)
+        return (self.ncols - 1) * dx + hfw
+
+    @property
+    def total_fov_y(self) -> float:
+        """Total vertical FOV in meters, accounting for overlap and tile aspect ratio."""
+        w, h = self.image_settings.resolution
+        hfw = self.image_settings.hfw
+        tile_fov_y = hfw * (h / w) if w > 0 else hfw
+        dy = tile_fov_y * (1 - self.overlap)
+        return (self.nrows - 1) * dy + tile_fov_y
 
     @property
     def total_fov(self) -> float:
-        """Total field of view in meters (width = ncols * tile_hfw)."""
-        return self.ncols * self.image_settings.hfw
+        """Total horizontal FOV in meters (alias for total_fov_x)."""
+        return self.total_fov_x
 
     @staticmethod
     def from_dict(d: dict) -> "OverviewAcquisitionSettings":
+        # backward compat: old configs had a bare use_focus_stack bool
+        if "focus_stack_settings" not in d and "use_focus_stack" in d:
+            fss = FocusStackSettings(enabled=d["use_focus_stack"])
+        else:
+            fss = FocusStackSettings.from_dict(d.get("focus_stack_settings", {}))
         return OverviewAcquisitionSettings(
             image_settings=ImageSettings.from_dict(d.get("image_settings", {})),
             nrows=d.get("nrows", 3),
             ncols=d.get("ncols", 3),
             overlap=d.get("overlap", 0.0),
-            use_focus_stack=d.get("use_focus_stack", False),
+            focus_stack_settings=fss,
+            autofocus_settings=AutoFocusSettings.from_dict(d.get("autofocus_settings", {})),
+            tile_order=TileOrderStrategy(d.get("tile_order", TileOrderStrategy.TYPEWRITER.value)),
         )
 
     def to_dict(self) -> dict:
@@ -870,7 +788,9 @@ class OverviewAcquisitionSettings:
             "nrows": self.nrows,
             "ncols": self.ncols,
             "overlap": self.overlap,
-            "use_focus_stack": self.use_focus_stack,
+            "focus_stack_settings": self.focus_stack_settings.to_dict(),
+            "autofocus_settings": self.autofocus_settings.to_dict(),
+            "tile_order": self.tile_order.value,
         }
 
 
@@ -996,8 +916,8 @@ class BeamSettings:
 
 @dataclass
 class FibsemDetectorSettings:
-    type: str = None
-    mode: str = None
+    type: str = "Unknown"
+    mode: str = "Unknown"
     brightness: float = 0.5
     contrast: float = 0.5
 
@@ -2202,74 +2122,100 @@ class FibsemImage:
 
     ### EXPERIMENTAL END ####
 
-    @classmethod
-    def fromAdornedImage(
-        cls,
-        adorned: 'AdornedImage',
-        image_settings: Optional[ImageSettings] = None,
-        state: Optional[MicroscopeState] = None,
-        beam_type: BeamType = BeamType.ELECTRON,
-    ) -> "FibsemImage":
-        """Creates FibsemImage from an AdornedImage (microscope output format).
+    def extract_region(self, rect: "FibsemRectangle") -> "FibsemImage":
+        """Extract a sub-region of the image and return a new FibsemImage with valid metadata.
+
+        The returned image has the same resolution/hfw as the original (metadata describes
+        the full scan), with reduced_area updated to reflect the extracted region.
 
         Args:
-            adorned (AdornedImage): Adorned Image from microscope
-            image_settings (ImageSettings, optional): Image settings. Defaults to None.
-            state (MicroscopeState, optional): Microscope state. Defaults to None.
-            beam_type (BeamType): Beam type for the image. Defaults to BeamType.ELECTRON.
+            rect (FibsemRectangle): Normalized rectangle (0–1 coordinates) defining the region to extract.
 
         Returns:
-            FibsemImage: instance of FibsemImage from AdornedImage
-            
+            FibsemImage: A new FibsemImage containing the cropped data and updated metadata.
+
         Raises:
-            ImportError: If AutoScript libraries are not available.
+            ValueError: If metadata is None or if rect coordinates are invalid / out of bounds.
         """
-        if not THERMO_API_AVAILABLE:
-            raise ImportError("AutoScript libraries not available. Cannot convert from AdornedImage.")
-        
-        if state is None:
-            state = MicroscopeState(
-                timestamp=adorned.metadata.acquisition.acquisition_datetime,
-                stage_position=FibsemStagePosition(
-                    adorned.metadata.stage_settings.stage_position.x,
-                    adorned.metadata.stage_settings.stage_position.y,
-                    adorned.metadata.stage_settings.stage_position.z,
-                    adorned.metadata.stage_settings.stage_position.r,
-                    adorned.metadata.stage_settings.stage_position.t,
-                ),
-                electron_beam=BeamSettings(beam_type=BeamType.ELECTRON),
-                ion_beam=BeamSettings(beam_type=BeamType.ION),
-            )
-        else:
-            state.timestamp = adorned.metadata.acquisition.acquisition_datetime
+        if self.metadata is None:
+            raise ValueError("Cannot extract region from FibsemImage without metadata.")
 
-        if image_settings is None:
-            from fibsem.utils import current_timestamp
-
-            image_settings = ImageSettings(
-                resolution=(adorned.width, adorned.height),
-                dwell_time=adorned.metadata.scan_settings.dwell_time,
-                hfw=adorned.width * adorned.metadata.binary_result.pixel_size.x,
-                autocontrast=True,
-                beam_type=beam_type,
-                autogamma=True,
-                save=False,
-                path="path",
-                filename=current_timestamp(),
-                reduced_area=None,
+        if not rect.is_valid_reduced_area:
+            raise ValueError(
+                f"Invalid rectangle: {rect.pretty_string}. "
+                "left/top must be >= 0, width/height > 0, and region must not exceed image bounds."
             )
 
-        pixel_size = Point(
-            adorned.metadata.binary_result.pixel_size.x,
-            adorned.metadata.binary_result.pixel_size.y,
+        # Convert normalized coords to pixel indices using existing helper
+        x, y, pw, ph = rect.to_pixel_coordinates(self.data.shape)  # (x, y, width, height)
+        cropped = self.data[y:y + ph, x:x + pw].copy()
+
+        # Clone metadata; only update reduced_area — resolution/hfw/pixel_size unchanged
+        from copy import deepcopy
+        new_metadata = deepcopy(self.metadata)
+        new_metadata.image_settings.reduced_area = rect
+
+        return FibsemImage(data=cropped, metadata=new_metadata)
+
+    def resize(self, resolution: Tuple[int, int]) -> "FibsemImage":
+        """Resize the image to the given resolution and return a new FibsemImage with updated metadata.
+
+        HFW is preserved; pixel_size is recalculated to match the new pixel dimensions.
+
+        Args:
+            resolution (Tuple[int, int]): Target resolution as (width, height) in pixels.
+
+        Returns:
+            FibsemImage: A new FibsemImage with resized data and updated metadata.
+
+        Raises:
+            ValueError: If metadata is None.
+        """
+        if self.metadata is None:
+            raise ValueError("Cannot resize FibsemImage without metadata.")
+
+        from skimage.transform import resize as skimage_resize
+        new_width, new_height = resolution
+        resized = skimage_resize(
+            self.data,
+            output_shape=(new_height, new_width),
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(self.data.dtype)
+
+        from copy import deepcopy
+        new_metadata = deepcopy(self.metadata)
+        new_metadata.image_settings.resolution = resolution
+        # pixel size scales inversely with resolution at fixed HFW
+        orig_height, orig_width = self.data.shape
+        new_metadata.pixel_size = Point(
+            x=self.metadata.pixel_size.x * (orig_width / new_width),
+            y=self.metadata.pixel_size.y * (orig_height / new_height),
         )
 
-        metadata = FibsemImageMetadata(
-            image_settings=image_settings,
-            pixel_size=pixel_size,
-            microscope_state=state,
-        )
-        return cls(data=adorned.data, metadata=metadata)
+        return FibsemImage(data=resized, metadata=new_metadata)
+
+    def apply_gamma(self, gamma: float) -> "FibsemImage":
+        """Return a copy of the image with the given gamma correction applied.
+
+        Args:
+            gamma (float): Gamma value to apply. Must be > 0.
+                Values < 1 brighten the image; values > 1 darken it.
+
+        Returns:
+            FibsemImage: New image with gamma-corrected data and the same metadata.
+
+        Raises:
+            ValueError: If gamma is not positive.
+        """
+        from fibsem.imaging.autogamma import apply_gamma as _apply_gamma
+        from copy import deepcopy
+        return FibsemImage(data=_apply_gamma(self.data, gamma), metadata=deepcopy(self.metadata))
+
+    @property
+    def brightness(self) -> float:
+        """Mean pixel intensity of the image."""
+        return float(np.mean(self.data))
 
     @staticmethod
     def generate_blank_image(

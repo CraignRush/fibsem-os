@@ -64,9 +64,8 @@ class FibsemMillingWidget2(QWidget):
 
         self.start_milling_signal.connect(self.run_milling, Qt.BlockingQueuedConnection) # type: ignore
 
-        # TODO: MIGRATE_MILLING_SIGNAL_HANDLING
-        # if self.parent_widget._milling_enabled:
-            # self.microscope.milling_progress_signal.connect(self._on_milling_progress)
+        if self.parent_widget._milling_enabled:
+            self.microscope.milling_progress_signal.connect(self._on_milling_progress)
 
         # TODO: milling message display
 
@@ -204,6 +203,7 @@ class FibsemMillingWidget2(QWidget):
         self._has_stages = any(s.enabled for s in stages)
         self._update_button_states()
 
+    @ensure_main_thread
     def _update_button_states(self):
         """Update the enabled/disabled state of buttons based on current milling state."""
         if self.is_milling:

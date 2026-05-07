@@ -576,19 +576,17 @@ STATUS_BAR_STYLESHEET = """
 
 
 INDETERMINATE_PROGRESS_BAR_STYLESHEET = """
-    QProgressBar {
-        border: 1px solid #3d4251;
-        border-radius: 3px;
-        background-color: #1e2027;
-        color: #d6d6d6;
-        text-align: center;
-        height: 6px;
-    }
-    QProgressBar::chunk {
-        background-color: #50a6ff;
-        border-radius: 3px;
-    }
-"""
+            QProgressBar {
+                border: 1px solid #3d4251;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1e2027;
+                color: #d6d6d6;
+            }
+            QProgressBar::chunk {
+                background-color: #50a6ff;
+            }
+        """
 
 # Color palette
 PRIMARY_COLOR = "#007ACC"
@@ -602,6 +600,7 @@ GRAY_PRIMARY_COLOR = "#5a626C"
 GRAY_HIGHLIGHT_COLOR = "#6A7380"
 GRAY_SECONDARY_COLOR = "#868E93"
 GRAY_ICON_COLOR = "#D1D2D4"
+WHITE_ICON_COLOR = "#ffffff"
 GRAY_TEXT_COLOR = "#F0F1F2"
 GRAY_WHITE_COLOR = "#FFFFFF"
 SEMANTIC_ERROR_COLOR = "#99121F"
@@ -623,6 +622,7 @@ WORKFLOW_BORDER_STYLESHEET = """
     QFrame#workflow_border_frame[borderState="waiting"]    { border: 4px solid #ff9800; }
     QFrame#workflow_border_frame[borderState="finished"]  { border: 4px solid #4caf50; }
     QFrame#workflow_border_frame[borderState="stopped"]   { border: 4px solid #99121F; }
+    QFrame#workflow_border_frame[borderState="agent"]     { border: 4px solid #BF00FF; }
 """
 
 TOOLBUTTON_ICON_STYLESHEET = """

@@ -5,13 +5,14 @@ from copy import deepcopy
 from typing import List, Optional
 
 import napari
-import napari.utils.notifications
 import numpy as np
 import yaml
 from napari.qt.threading import thread_worker
 from PyQt5 import QtCore, QtWidgets
+from superqt import ensure_main_thread
 
 from fibsem import config as cfg
+from fibsem.ui import notification_service
 from fibsem import constants, conversions, utils
 from fibsem.microscope import FibsemMicroscope
 from fibsem.structures import (
@@ -43,8 +44,8 @@ from fibsem.ui.widgets.custom_widgets import IconToolButton, TitledPanel
 INSTRUCTIONS_TEXT = """Instructions: Double Click to Move. Alt + Double Click to Move Vertically"""
 
 class FibsemMovementWidget(QtWidgets.QWidget):
-    saved_positions_updated_signal = QtCore.pyqtSignal(object)  # TODO: investigate the use of this signal
-    movement_progress_signal = QtCore.pyqtSignal(dict) # TODO: consolidate
+    saved_positions_updated_signal = QtCore.pyqtSignal(object)
+    movement_progress_signal = QtCore.pyqtSignal(dict)
 
     def __init__(
         self,
@@ -119,13 +120,13 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         self.doubleSpinBox_movement_stage_rotation = QtWidgets.QDoubleSpinBox()
         self.doubleSpinBox_movement_stage_rotation.setMinimum(-360.0)
         self.doubleSpinBox_movement_stage_rotation.setMaximum(360.0)
-        self.doubleSpinBox_movement_stage_rotation.setSuffix(" deg")
+        self.doubleSpinBox_movement_stage_rotation.setSuffix(f" {constants.DEGREE_SYMBOL}")
         self.gridLayout_3.addWidget(self.label_movement_stage_rotation, 3, 0)
         self.gridLayout_3.addWidget(self.doubleSpinBox_movement_stage_rotation, 3, 1)
 
         self.label_movement_stage_tilt = QtWidgets.QLabel("Tilt")
         self.doubleSpinBox_movement_stage_tilt = QtWidgets.QDoubleSpinBox()
-        self.doubleSpinBox_movement_stage_tilt.setSuffix(" deg")
+        self.doubleSpinBox_movement_stage_tilt.setSuffix(f" {constants.DEGREE_SYMBOL}")
         self.gridLayout_3.addWidget(self.label_movement_stage_tilt, 4, 0)
         self.gridLayout_3.addWidget(self.doubleSpinBox_movement_stage_tilt, 4, 1)
 
@@ -217,8 +218,11 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         self.btn_refresh_stage.clicked.connect(lambda: self.update_ui(None))
 
         # register mouse callbacks
-        self.image_widget.eb_layer.mouse_double_click_callbacks.append(self._double_click)
-        self.image_widget.ib_layer.mouse_double_click_callbacks.append(self._double_click)
+        if cfg.FEATURE_VIEWER_MOVEMENT_EVENTS:
+            self.viewer.mouse_double_click_callbacks.append(self._viewer_double_click)
+        else:
+            self.image_widget.eb_layer.mouse_double_click_callbacks.append(self._double_click)
+            self.image_widget.ib_layer.mouse_double_click_callbacks.append(self._double_click)
 
         # disable ui elements
         self.label_movement_instructions.setText(INSTRUCTIONS_TEXT)
@@ -333,8 +337,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         msg = ddict.get("msg", None)
         if msg is not None:
             logging.debug(msg)
-            napari.utils.notifications.notification_manager.records.clear()
-            napari.utils.notifications.show_info(msg)
+            notification_service.show_toast(msg)
 
         is_finished = ddict.get("finished", False)
         if is_finished:
@@ -346,6 +349,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         if is_finished:
             self.update_ui()
 
+    @ensure_main_thread
     def update_ui(self, stage_position: Optional[FibsemStagePosition] = None):
         """Update the UI with the current stage position and saved positions"""
         if stage_position is None:
@@ -371,6 +375,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         # update the current position label
         update_text_overlay(self.viewer, self.microscope, stage_position=stage_position)
 
+    @ensure_main_thread
     def update_ui_after_movement(self, retake: bool = True):
         if (retake is False or self.microscope.is_acquiring):
             self.update_ui()
@@ -442,6 +447,16 @@ class FibsemMovementWidget(QtWidgets.QWidget):
 
         return stage_position
 
+    def _viewer_double_click(self, viewer, event):
+        """Viewer-level double-click callback (FEATURE_VIEWER_MOVEMENT_EVENTS).
+        Determines which image layer was clicked and delegates to _double_click."""
+        for layer in [self.image_widget.eb_layer, self.image_widget.ib_layer]:
+            coords = layer.world_to_data(event.position)
+            _, beam_type, _ = self.image_widget.get_data_from_coord(coords)
+            if beam_type is not None:
+                self._double_click(layer, event)
+                return
+
     def _double_click(self, layer, event):
         """Callback for double-click mouse events on the image widget"""
         self._toggle_interactions(enable= False)
@@ -457,7 +472,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
             return
 
         if hasattr(self.parent, "milling_widget") and self.parent.milling_widget.is_milling:
-            napari.utils.notifications.show_info("Cannot move stage while milling is in progress.")
+            notification_service.show_toast("Cannot move stage while milling is in progress.")
             return
 
         # get coords
@@ -468,12 +483,12 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         self.movement_progress_signal.emit({"msg": "Click to move in progress..."})
 
         if beam_type is None:
-            napari.utils.notifications.show_info(
+            notification_service.show_toast(
                 "Clicked outside image dimensions. Please click inside the image to move."
             )
             return
         if image.metadata is None:
-            napari.utils.notifications.show_info(
+            notification_service.show_toast(
                 "Image metadata is not set. Please set the image metadata before moving."
             )
             return
@@ -589,13 +604,13 @@ class FibsemMovementWidget(QtWidgets.QWidget):
         """Update the currently selected saved position to the current stage position"""
         current_index = self.comboBox_positions.currentIndex()
         if current_index == -1:
-            napari.utils.notifications.show_warning("Please select a position to update")
+            notification_service.show_toast("Please select a position to update", "warning")
             return
 
         position: FibsemStagePosition = self.microscope.get_stage_position()
         position.name = self.lineEdit_position_name.text()
         if position.name == "":
-            napari.utils.notifications.show_warning("Please enter a name for the position")
+            notification_service.show_toast("Please enter a name for the position", "warning")
             return
 
         # TODO: add dialog confirmation
@@ -617,7 +632,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
             _filter="YAML Files (*.yaml)")
 
         if path == '':
-            napari.utils.notifications.show_info("No file selected, positions not saved")
+            notification_service.show_toast("No file selected, positions not saved")
             return
 
         response = message_box_ui(text="Do you want to overwrite the file ? Click no to append the new positions to the existing file.", 
@@ -635,7 +650,7 @@ class FibsemMovementWidget(QtWidgets.QWidget):
             path = open_existing_file_dialog(msg="Select a positions file", path=cfg.POSITION_PATH, _filter="YAML Files (*.yaml)")
         
         if path == "":
-            napari.utils.notifications.show_info("No file selected, positions not loaded")
+            notification_service.show_toast("No file selected, positions not loaded")
             return
 
         def load_saved_positions_from_yaml(path: Optional[str] = None) -> List[FibsemStagePosition]:

@@ -38,7 +38,6 @@ from fibsem.structures import (
     ImageSettings,
     MicroscopeState,
     Point,
-    ReferenceImages,
     ReferenceImageParameters,
 )
 from fibsem.utils import configure_logging, format_duration
@@ -54,12 +53,74 @@ class AutoLamellaTaskStatus(Enum):
     Skipped = auto()
 
 
+@dataclass
+class AutoLamellaUser:
+    """Application-level user identity. Maps to the DB user table."""
+    _id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    username: str = ""          # login handle / OS username
+    name: str = ""              # display name
+    email: str = ""
+    organization: str = ""
+    role: str = "user"          # "admin" | "user" | "guest"
+    is_default: bool = False    # loaded automatically at startup
+    preferences: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=lambda: datetime.timestamp(datetime.now()))
+
+    def to_fibsem_user(self) -> "FibsemUser":
+        """Convert to a FibsemUser snapshot for image TIFF metadata."""
+        from fibsem.structures import FibsemUser
+        return FibsemUser(
+            name=self.name or self.username,
+            email=self.email,
+            organization=self.organization,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "_id": self._id,
+            "username": self.username,
+            "name": self.name,
+            "email": self.email,
+            "organization": self.organization,
+            "role": self.role,
+            "is_default": self.is_default,
+            "preferences": self.preferences,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AutoLamellaUser":
+        user = cls(
+            username=data.get("username", ""),
+            name=data.get("name", ""),
+            email=data.get("email", ""),
+            organization=data.get("organization", ""),
+            role=data.get("role", "user"),
+            is_default=data.get("is_default", False),
+            preferences=data.get("preferences", {}),
+            created_at=data.get("created_at", datetime.timestamp(datetime.now())),
+        )
+        if "_id" in data:
+            user._id = data["_id"]
+        return user
+
+    @staticmethod
+    def from_environment() -> "AutoLamellaUser":
+        """Create a default user from the OS environment."""
+        import platform
+        import socket
+        username = os.environ.get("USERNAME") or os.environ.get("USER", "user")
+        hostname = socket.gethostname() if platform.system() in ("Linux", "Darwin") \
+            else os.environ.get("COMPUTERNAME", "hostname")
+        return AutoLamellaUser(username=username, name=username, is_default=True)
+
+
 @evented
 @dataclass
 class AutoLamellaTaskState:
     name: str = ""
     step: str = ""
-    task_id: str = ""
+    task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     task_type: str = ""
     lamella_id: str = ""
     start_timestamp: float = field(default_factory=lambda: datetime.timestamp(datetime.now()))
@@ -319,22 +380,58 @@ class AutoLamellaWorkflowOptions:
 
 @evented
 @dataclass
+class LamellaDefaultConfig:
+    """Initial state applied to every new Lamella created from this protocol."""
+    use_petname: bool = True
+    name_prefix: str = ""
+    alignment_area: Optional[FibsemRectangle] = None
+    poi: Optional[Point] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "use_petname": self.use_petname,
+            "name_prefix": self.name_prefix,
+        }
+        if self.alignment_area is not None:
+            d["alignment_area"] = self.alignment_area.to_dict()
+        if self.poi is not None:
+            d["poi"] = self.poi.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'LamellaDefaultConfig':
+        aa = data.get("alignment_area")
+        poi = data.get("poi")
+        return cls(
+            use_petname=data.get("use_petname", True),
+            name_prefix=data.get("name_prefix", ""),
+            alignment_area=FibsemRectangle.from_dict(aa) if isinstance(aa, dict) else None,
+            poi=Point.from_dict(poi) if isinstance(poi, dict) else None,
+        )
+
+
+@evented
+@dataclass
 class AutoLamellaTaskProtocol:
     name: str = "AutoLamella Task Protocol"
     description: str = "Protocol for AutoLamella"
     version: str = "1.0"
+    _id: str = field(default_factory=lambda: str(uuid.uuid4()))
     task_config: EventedDict[str, AutoLamellaTaskConfig] = field(default_factory=lambda: EventedDict())   # unique_name: AutoLamellaTaskConfig
     workflow_config: AutoLamellaWorkflowConfig = field(default_factory=AutoLamellaWorkflowConfig)
     options: AutoLamellaWorkflowOptions = field(default_factory=AutoLamellaWorkflowOptions)
+    lamella_defaults: LamellaDefaultConfig = field(default_factory=LamellaDefaultConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "_id": self._id,
             "name": self.name,
             "description": self.description,
             "version": self.version,
             "tasks": {k: v.to_dict() for k, v in self.task_config.items()},
             "workflow": self.workflow_config.to_dict(),
             "options": self.options.to_dict(),
+            "lamella_defaults": self.lamella_defaults.to_dict(),
         }
 
     @classmethod
@@ -343,14 +440,18 @@ class AutoLamellaTaskProtocol:
         task_config = load_task_config(data.get("tasks", {}))
         workflow_config = AutoLamellaWorkflowConfig.from_dict(data.get("workflow", {}))
 
-        return cls(
+        protocol = cls(
             name=data.get("name", "AutoLamella Task Protocol"),
             description=data.get("description", "Protocol for AutoLamella"),
             version=data.get("version", "1.0"),
             task_config=task_config,
             workflow_config=workflow_config,
-            options=AutoLamellaWorkflowOptions.from_dict(data.get("options", {}))
+            options=AutoLamellaWorkflowOptions.from_dict(data.get("options", {})),
+            lamella_defaults=LamellaDefaultConfig.from_dict(data.get("lamella_defaults", {})),
         )
+        if "_id" in data:
+            protocol._id = data["_id"]
+        return protocol
 
     @classmethod
     def load(cls, filename: str) -> 'AutoLamellaTaskProtocol':
@@ -623,7 +724,7 @@ class Lamella:
 
     @property
     def is_failure(self) -> bool:
-        return self.defect.state != DefectType.NONE
+        return self.defect.state is DefectType.FAILURE
 
     @property
     def stage_position(self) -> FibsemStagePosition:
@@ -788,17 +889,6 @@ class Lamella:
             data = np.stack([data, data, data], axis=2)
         Image.fromarray(data.astype(np.uint8)).save(os.path.join(self.path, "thumbnail.png"))
 
-    # convert to method
-    def get_reference_images(self, filename: str) -> ReferenceImages:
-        reference_images = ReferenceImages(
-            low_res_eb=self.load_reference_image(f"{filename}_low_res_eb"),
-            high_res_eb=self.load_reference_image(f"{filename}_high_res_eb"),
-            low_res_ib=self.load_reference_image(f"{filename}_low_res_ib"),
-            high_res_ib=self.load_reference_image(f"{filename}_high_res_ib"),
-        )
-
-        return reference_images
-
     # def get_task_config_by_type(self, task_type: Type['AutoLamellaTaskConfig']) -> Dict[str, AutoLamellaTaskConfig]:
     #     """Get the task configuration by type."""
     #     task_configs = {}
@@ -866,7 +956,7 @@ class Experiment:
         self.task_protocol: AutoLamellaTaskProtocol = None # must be set externally
         self.metadata: Dict[str, Any] = metadata if metadata is not None else {}
 
-    def to_dict(self) -> dict:
+    def to_dict(self, include_protocol: bool = False) -> dict:
 
         state_dict = {
             "name": self.name,
@@ -877,6 +967,9 @@ class Experiment:
             "created_at": self.created_at,
             "metadata": self.metadata,
         }
+
+        if include_protocol:
+            state_dict["protocol"] = self.task_protocol.to_dict() if self.task_protocol is not None else None
 
         return state_dict
 
@@ -947,11 +1040,13 @@ class Experiment:
         """Return the Lamella with the given name, or None if not found."""
         return next((p for p in self.positions if p.name == name), None)
 
-    def save(self) -> None:
+    def save(self, save_protocol: bool = False) -> None:
         """Save the sample data to yaml file"""
 
         with open(os.path.join(self.path, "experiment.yaml"), "w") as f:
             yaml.safe_dump(self.to_dict(), f, indent=4)
+        if save_protocol:
+            self.save_protocol()
 
     def __repr__(self) -> str:
 
@@ -1178,10 +1273,14 @@ class Experiment:
                         task_config: EventedDict[str, AutoLamellaTaskConfig],
                         name: Optional[str] = None) -> None:
         """Create a new lamella and add it to the experiment."""
-        # create the petname and path
-        number = len(self.positions) + 1
+        template = self.task_protocol.lamella_defaults
+        number = max((pos.number for pos in self.positions), default=0) + 1
         if name is None:
-            name = f"{number:02d}-{petname.generate(2)}"
+            sep = "-" if template.name_prefix else ""
+            if template.use_petname:
+                name = f"{template.name_prefix}{sep}{number:02d}-{petname.generate(2)}"
+            else:
+                name = f"{template.name_prefix}{sep}Lamella-{number:02d}"
         path = Path(os.path.join(self.path, name))
 
         # create the lamella
@@ -1189,6 +1288,10 @@ class Experiment:
                           path=path,
                           number=number,
                           task_config=deepcopy(task_config))
+        if template.alignment_area is not None:
+            lamella.alignment_area = deepcopy(template.alignment_area)
+        if template.poi is not None:
+            lamella.poi = deepcopy(template.poi)
         lamella.milling_pose = microscope_state
 
         # create the lamella directory

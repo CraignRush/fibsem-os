@@ -2,7 +2,6 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import napari
-import napari.utils.notifications
 import numpy as np
 from napari.layers import Image as NapariImageLayer
 from napari.layers import Points as NapariPointLayer
@@ -23,6 +22,7 @@ from fibsem.structures import (
     ImageSettings,
 )
 from fibsem.ui import stylesheets as stylesheets
+from fibsem.ui import notification_service
 from fibsem.ui.napari.patterns import (
     convert_reduced_area_to_napari_shape,
     convert_shape_to_image_area,
@@ -451,9 +451,9 @@ class FibsemImageSettingsWidget(QtWidgets.QWidget):
         beam_widget.sync_from_microscope()
         if name == "AutoFocus":
             wd = beam_widget.beam_settings_widget.working_distance_spinbox.value()
-            napari.utils.notifications.show_info(f"AutoFocus Complete. Best WD: {wd:.2f}mm")
+            notification_service.show_toast(f"AutoFocus Complete. Best WD: {wd:.2f}mm")
         if name == "AutoContrast":
-            napari.utils.notifications.show_info("AutoContrast Complete.")
+            notification_service.show_toast("AutoContrast Complete.")
 
     def _get_image_settings_from_ui(self) -> ImageSettings:
         """Get the image settings from the UI and return an ImageSettings object."""
@@ -504,8 +504,13 @@ class FibsemImageSettingsWidget(QtWidgets.QWidget):
 
     def update_ui_saving_settings(self) -> None:
         """Toggle the visibility / state of the image saving settings"""
+        # If save_with_selected_lamella is checked, ensure save_image is also checked
+        if self.checkBox_save_with_selected_lamella.isChecked():
+            self.image_settings_widget.save_image_check.blockSignals(True)
+            self.image_settings_widget.save_image_check.setChecked(True)
+            self.image_settings_widget.save_image_check.blockSignals(False)
+
         save_image = self.image_settings_widget.save_image_check.isChecked()
-        self.checkBox_save_with_selected_lamella.setEnabled(save_image)
 
         save_with_lamella = self.checkBox_save_with_selected_lamella.isChecked()
         self.image_settings_widget.path_edit.setEnabled(save_image and not save_with_lamella)
@@ -563,8 +568,7 @@ class FibsemImageSettingsWidget(QtWidgets.QWidget):
         msg = ddict.get("msg", None)
         if msg is not None:
             logging.debug(msg)
-            napari.utils.notifications.notification_manager.records.clear()
-            napari.utils.notifications.show_info(msg)
+            notification_service.show_toast(msg)
 
         # TODO: implement progress bar for acquisition
 

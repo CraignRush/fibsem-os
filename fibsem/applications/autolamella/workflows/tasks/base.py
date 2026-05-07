@@ -245,8 +245,8 @@ class AutoLamellaTask(ABC):
         if self.parent_ui is None:
             if milling_enabled:
                 milling_task = run_milling_task(self.microscope, milling_config, None)
-                milling_task_config = milling_task.config
-            return milling_task_config
+                return milling_task.config
+            return milling_config
 
         if self.parent_ui.milling_task_config_widget is None:
             raise ValueError("Milling task config widget is not set in the parent UI.")
@@ -268,18 +268,12 @@ class AutoLamellaTask(ABC):
 
         while response and milling_enabled:
             self.update_status_ui(f"Milling {milling_config.name}...")
+            # BlockingQueuedConnection guarantees run_milling() has returned and
+            # _milling_thread.start() has been called before emit() unblocks.
+            # No need to poll for is_milling to become True — it already is (or
+            # milling finished before we got here, in which case the loop below
+            # exits immediately, which is correct).
             self.parent_ui.milling_task_config_widget.milling_widget.start_milling_signal.emit()
-
-            # wait for milling to start
-            wait_for_milling_timeout = 60  # seconds
-            start_wait = time.time()
-            while not self.parent_ui.milling_task_config_widget.milling_widget.is_milling:
-                logging.info("Waiting for milling to start...")
-                if time.time() - start_wait > wait_for_milling_timeout:
-                    logging.warning(f"Timed out waiting for milling to start after {wait_for_milling_timeout}s.")
-                    raise TimeoutError("Timed out waiting for milling to start.")
-                self._check_for_abort()
-                time.sleep(0.1)
 
             # wait for milling to finish
             logging.info("WAITING FOR MILLING TO FINISH... ")
@@ -349,6 +343,18 @@ class AutoLamellaTask(ABC):
 
         # load reference image, align
         ref_image = FibsemImage.load(full_filename)
+        FEATURE_USE_ALIGNMENT_CONVERGENCE_METHOD = False
+        if FEATURE_USE_ALIGNMENT_CONVERGENCE_METHOD:
+            alignment.align_until_converged(microscope=self.microscope, 
+                                            ref_image=ref_image, 
+                                    beam_type=BeamType.ION,
+                                    use_autocontrast=True,
+                                    max_steps=5, 
+                                    minimum_response=0.5,
+                                    stop_event=self._stop_event,
+                                    save_plot=True,
+                                    plot_title=f"{self.lamella.name} - {self.task_name}")
+            return
         alignment.multi_step_alignment_v2(microscope=self.microscope,
                                         ref_image=ref_image,
                                         beam_type=BeamType.ION,
@@ -439,6 +445,16 @@ class AutoLamellaTask(ABC):
         if self.lamella.milling_pose is None:
             raise ValueError(f"Milling pose for {self.lamella.name} is not set. Please set the milling pose before milling the lamella.")
         self.microscope.set_microscope_state(self.lamella.milling_pose)
+
+    def _get_stage_position_for_orientation(
+        self,
+        stage_position: FibsemStagePosition,
+        orientation: Optional[str],
+    ) -> FibsemStagePosition:
+        """Return target position for orientation, or stage_position unchanged if orientation is None."""
+        if orientation is None:
+            return stage_position
+        return self.microscope.get_target_position(stage_position, orientation)
 
     def _acquire_alignment_reference_image(self,
                                             image_settings: ImageSettings,

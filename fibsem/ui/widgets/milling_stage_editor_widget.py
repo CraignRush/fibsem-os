@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import napari
-import napari.utils.notifications
 from napari.layers import Image as NapariImageLayer
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -33,6 +32,7 @@ from PyQt5.QtWidgets import (
 from superqt import QCollapsible, QIconifyIcon
 
 from fibsem import conversions, utils
+from fibsem.ui import notification_service
 from fibsem.microscope import FibsemMicroscope
 from fibsem.milling import (
     FibsemMillingStage,
@@ -632,7 +632,7 @@ class FibsemMillingStageEditorWidget(QWidget):
         self.list_widget_milling_stages.setMinimumHeight(80)
         if self.viewer is not None:
             self.viewer.mouse_drag_callbacks.append(self._on_single_click)
-            if self.image_widget is not None and cfg.FEATURE_RIGHT_CLICK_CONTEXT_MENU_ENABLED:
+            if self.image_widget is not None:
                 self.viewer.mouse_drag_callbacks.append(self._on_right_click)
 
         # set initial selection to the first item
@@ -1146,7 +1146,7 @@ class FibsemMillingStageEditorWidget(QWidget):
             if not is_pattern_placement_valid(pattern=pattern_copy, image=self.image):
                 msg = f"{milling_stage.name} pattern would be outside the FIB image."
                 logging.warning(msg)
-                napari.utils.notifications.show_warning(msg)
+                notification_service.show_toast(msg, "warning")
                 return False
 
             new_points.append((idx, new_point))
