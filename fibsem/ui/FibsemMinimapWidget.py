@@ -31,9 +31,6 @@ from superqt import ensure_main_thread
 
 from fibsem import constants, conversions
 from fibsem.ui import notification_service
-from fibsem.applications.autolamella.config import (
-    FEATURE_DISPLAY_GRID_CENTER_MARKER,
-)
 from fibsem.applications.autolamella.protocol.constants import (
     FIDUCIAL_KEY,
     MICROEXPANSION_KEY,
@@ -77,7 +74,14 @@ from fibsem.ui.napari.utilities import (
     is_inside_image_bounds,
     update_text_overlay,
 )
-from fibsem.ui.widgets.custom_widgets import ContextMenu, ContextMenuConfig, LamellaNameListWidget, TitledPanel
+from fibsem.ui.widgets.custom_widgets import (
+    ContextMenu,
+    ContextMenuConfig,
+    LamellaNameListWidget,
+    TitledPanel,
+    ValueComboBox,
+    ValueSpinBox,
+)
 from fibsem.ui.widgets.overview_acquisition_settings_widget import (
     OverviewAcquisitionSettingsWidget,
 )
@@ -274,7 +278,7 @@ class FibsemMinimapWidget(QWidget):
         self.gridLayout_2.addWidget(self.label_pattern_overlay, 4, 0)
 
         self.checkBox_pattern_overlay = QCheckBox("Display Pattern")
-        self.comboBox_pattern_overlay = QComboBox()
+        self.comboBox_pattern_overlay = ValueComboBox()
         self.gridLayout_2.addWidget(self.checkBox_pattern_overlay, 5, 0)
         self.gridLayout_2.addWidget(self.comboBox_pattern_overlay, 5, 1)
 
@@ -288,7 +292,7 @@ class FibsemMinimapWidget(QWidget):
         self.gridLayout_4.setContentsMargins(4, 4, 4, 4)
 
         self.label_correlation_selected_layer = QLabel("Selected Layer")
-        self.comboBox_correlation_selected_layer = QComboBox()
+        self.comboBox_correlation_selected_layer = ValueComboBox()
         self.gridLayout_4.addWidget(self.label_correlation_selected_layer, 0, 0)
         self.gridLayout_4.addWidget(self.comboBox_correlation_selected_layer, 0, 1, 1, 2)
 
@@ -300,9 +304,9 @@ class FibsemMinimapWidget(QWidget):
         self.gridLayout_4.addWidget(self.label_gb_width, 2, 1)
         self.gridLayout_4.addWidget(self.label_gb_spacing, 2, 2)
 
-        self.doubleSpinBox_gb_width = QDoubleSpinBox()
+        self.doubleSpinBox_gb_width = ValueSpinBox()
         self.doubleSpinBox_gb_width.setMaximum(10000.0)
-        self.doubleSpinBox_gb_spacing = QDoubleSpinBox()
+        self.doubleSpinBox_gb_spacing = ValueSpinBox()
         self.doubleSpinBox_gb_spacing.setMaximum(10000.0)
         self.gridLayout_4.addWidget(self.doubleSpinBox_gb_width, 3, 1)
         self.gridLayout_4.addWidget(self.doubleSpinBox_gb_spacing, 3, 2)
@@ -372,6 +376,7 @@ class FibsemMinimapWidget(QWidget):
         self._on_experiment_changed()
         self._update_position_display()
         self.draw_blank_image()
+        self._update_position_display()
 
     @property
     def microscope(self) -> FibsemMicroscope:
@@ -452,8 +457,10 @@ class FibsemMinimapWidget(QWidget):
         self.label_instructions.setStyleSheet(stylesheets.LABEL_INSTRUCTIONS_STYLE)
         self.scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # type: ignore
 
-        # right-click context menu
+        # viewer-level click callbacks
         self.viewer.mouse_drag_callbacks.append(self._on_right_click)
+        self.viewer.mouse_drag_callbacks.append(self.on_single_click)
+        self.viewer.mouse_double_click_callbacks.append(self.on_double_click)
 
         self._update_position_display()
         self.toggle_interaction(enable=True)
@@ -591,7 +598,12 @@ class FibsemMinimapWidget(QWidget):
     def tile_collection_finished(self, result: dict):
         self._acquisition_worker = None
         self._thread_stop_event.clear()
-        notification_service.show_toast("Tile collection finished.")
+        if result.get("error"):
+            notification_service.show_toast(str(result["error"]), "error")
+        elif result.get("cancelled"):
+            notification_service.show_toast("Tile collection cancelled.", "warning")
+        else:
+            notification_service.show_toast("Tile collection finished.")
         self.update_viewer(self.image)
         self.toggle_interaction(enable=True)
 
@@ -604,7 +616,7 @@ class FibsemMinimapWidget(QWidget):
         self._tiles_acquired: int = 0
         self._tile_total_count: int = 0
         _start_time = time.time()
-        _error: bool = False
+        _error: Optional[Exception] = None
         try:
             self.image = tiled.tiled_image_acquisition_and_stitch(
                 microscope=microscope,
@@ -613,7 +625,7 @@ class FibsemMinimapWidget(QWidget):
             )
         except Exception as e:
             logging.error(f"Error in tile collection: {e}", exc_info=True)
-            _error = True
+            _error = e
         finally:
             elapsed = time.time() - _start_time
             cancelled = self._thread_stop_event.is_set()
@@ -758,10 +770,6 @@ class FibsemMinimapWidget(QWidget):
                 notification_service.show_toast("Error adding image layer to viewer.", "error")
                 return
 
-            self.image_layer.mouse_drag_callbacks.clear()
-            self.image_layer.mouse_double_click_callbacks.clear()
-            self.image_layer.mouse_drag_callbacks.append(self.on_single_click) # TODO: migrate to use viewer.events, rather than image layer
-            self.image_layer.mouse_double_click_callbacks.append(self.on_double_click)
             self.viewer.reset_view()
 
             # NOTE: how to do respace scaling, convert to infinite canvas
@@ -804,69 +812,22 @@ class FibsemMinimapWidget(QWidget):
 
         return coords, point
 
-    def on_single_click(self, layer: NapariImageLayer, event: NapariEvent) -> None:
-        """Callback for single click on the image layer.
-        Supports adding and updating positions with Shift and Alt modifiers.
-        No modifier: checks closest experiment position.
-        Args:
-            layer: The image layer.
-            event: The event object.
-        """
-
-        update_position: bool = "Shift" in event.modifiers
-        add_new_position: bool = "Alt" in event.modifiers
-        no_modifier: bool = len(event.modifiers) == 0
-
-        # left click only
+    def on_single_click(self, viewer, event: NapariEvent) -> None:
+        """Callback for single click on the viewer. Selects the nearest experiment position."""
         if event.button != 1:
             return
-
-        coords, point = self.get_coordinate_in_microscope_coordinates(layer, event)
-
-        if point is False: # clicked outside image
+        if self.image_layer is None or self.image_layer not in self.viewer.layers:
             return
-
+        coords, point = self.get_coordinate_in_microscope_coordinates(self.image_layer, event)
+        if point is False:
+            return
         if self.image is None or self.image.metadata is None:
             return
-
-        # get the stage position (xyzrt) based on the clicked point and projection
         stage_position = self.microscope.project_stable_move(
-                    dx=point.x, dy=point.y,
-                    beam_type=self.image.metadata.image_settings.beam_type,
-                    base_position=self.image.metadata.stage_position)
-
-        # no modifier: check closest position
-        if no_modifier:
-            self.check_closest_experiment_position(stage_position)
-            return
-
-        # handle case where multiple modifiers are pressed
-        if update_position and add_new_position:
-            notification_service.show_toast("Please select either Shift or Alt modifier, not both.", "warning")
-            return
-
-        if self.parent_widget is None or self.parent_widget.experiment is None:
-            return # prevent editing positions directly if not using autolamella
-
-        # check if position is within stage limits
-        if not stage_position.is_within_limits(self.microscope._stage.limits, axes=["x", "y"]):
-            notification_service.show_toast("Position is outside stage limits. Please select a position within the stage limits.", "warning")
-            return
-
-        if update_position:
-            idx = self.lamella_list.selected_index
-            if idx == -1:
-                logging.debug("No position selected to update.")
-                return
-            self.parent_widget.experiment.positions[idx].stage_position = stage_position # not evented, so need to manually update
-            self.parent_widget.experiment.save()
-            self._update_position_display()
-        elif add_new_position:
-            self.parent_widget.add_new_lamella(stage_position)
-            # NOTE: PY_38 doesnt support callback for experiment.events required to refresh the display, so we
-            # are hacking it here, by force calling the update display
-            if sys.version_info < (3, 9):
-                self._update_position_display()
+            dx=point.x, dy=point.y,
+            beam_type=self.image.metadata.image_settings.beam_type,
+            base_position=self.image.metadata.stage_position)
+        self.check_closest_experiment_position(stage_position)
 
     def check_closest_experiment_position(self, clicked_position: FibsemStagePosition) -> None:
         """Check and print distances to all experiment positions, highlighting the closest one.
@@ -897,22 +858,19 @@ class FibsemMinimapWidget(QWidget):
             self.lamella_list.select(closest_name)
             return
 
-    def on_double_click(self, layer: NapariImageLayer, event: NapariEvent) -> None:
-        """Callback for double click on the image layer.
-        Moves the stage to the clicked position.
-        Args:
-            layer: The image layer.
-            event: The event object.
-        """
-
+    def on_double_click(self, viewer, event: NapariEvent) -> None:
+        """Callback for double click on the viewer. Moves the stage to the clicked position."""
         if self.parent_widget.is_workflow_running:
             notification_service.show_toast("Cannot move stage while workflow is running.", "warning")
             return
 
-        if event.button != 1: # left click only
+        if event.button != 1:
             return
 
-        coords, point = self.get_coordinate_in_microscope_coordinates(layer, event)
+        if self.image_layer is None or self.image_layer not in self.viewer.layers:
+            return
+
+        coords, point = self.get_coordinate_in_microscope_coordinates(self.image_layer, event)
 
         if point is False: # clicked outside image
             return
@@ -1018,7 +976,12 @@ class FibsemMinimapWidget(QWidget):
             logging.debug("No position selected to update.")
             return
 
-        self.parent_widget.experiment.positions[idx].stage_position = stage_position
+        lamella = self.parent_widget.experiment.positions[idx]
+        lamella.stage_position = stage_position
+
+        # keep the milling angle consistent with the updated milling pose
+        lamella.update_milling_angle(self.microscope)
+
         self.parent_widget.experiment.save()
         self._update_position_display()
 
@@ -1098,6 +1061,9 @@ class FibsemMinimapWidget(QWidget):
     def draw_current_stage_position(self, stage_position: Optional[FibsemStagePosition] = None):
         """Draws the current stage position on the image."""
         if self.image is None or self.image.metadata is None:
+            return
+
+        if self.microscope is None:
             return
 
         if self.is_acquiring:
@@ -1306,18 +1272,17 @@ class FibsemMinimapWidget(QWidget):
             ))
 
         # grid positions
-        if FEATURE_DISPLAY_GRID_CENTER_MARKER:
-            grid_positions = [g.position for g in self.microscope._stage.holder.grids.values()]
-            grid_points = tiled.reproject_stage_positions_onto_image2(self.image, grid_positions)
-            for i, grid_point in enumerate(grid_points):
-                grid_lines = create_crosshair_shape(grid_point, crosshair_size, layer_scale)
-                for line, txt in zip(grid_lines, [grid_positions[i].name, ""]):
-                    overlays.append(NapariShapeOverlay(
-                        shape=line,
-                        color=CROSSHAIR_CONFIG["colors"]["grid"],
-                        label=txt,
-                        shape_type="line"
-                    ))
+        grid_positions = [s.position for s in self.microscope._stage.holder.slots.values()]
+        grid_points = tiled.reproject_stage_positions_onto_image2(self.image, grid_positions)
+        for i, grid_point in enumerate(grid_points):
+            grid_lines = create_crosshair_shape(grid_point, crosshair_size, layer_scale)
+            for line, txt in zip(grid_lines, [grid_positions[i].name, ""]):
+                overlays.append(NapariShapeOverlay(
+                    shape=line,
+                    color=CROSSHAIR_CONFIG["colors"]["grid"],
+                    label=txt,
+                    shape_type="line"
+                ))
 
         # current stage position
         current_lines = create_crosshair_shape(current_point, crosshair_size, layer_scale)

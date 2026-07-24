@@ -6,13 +6,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, List, Optional, Union
 
-from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QCursor, QIcon, QTransform
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QCursor, QIcon, QPainter
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QAction,
     QComboBox,
     QDoubleSpinBox,
+    QSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -25,10 +27,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from superqt import QIconifyIcon
+from fibsem.ui.icon import ICON_MOVE_TO_POSITION, ICON_UPDATE_POSITION, fibsem_icon, qta
 
 from fibsem.ui import stylesheets as stylesheets
-from fibsem.ui.utils import WheelBlocker
+from fibsem.ui.utils import install_wheel_blocker
 from fibsem.utils import format_value
 
 
@@ -108,7 +110,48 @@ class QDirectoryLineEdit(QWidget):
     def setText(self, text: str) -> None:
         self.lineEdit.setText(text)
 
-def _create_combobox_control(value: Union[str, int, float, Enum], 
+class QFileLineEdit(QWidget):
+    """Line edit with a browse button that opens a file picker dialog."""
+
+    textChanged = pyqtSignal(str)
+    editingFinished = pyqtSignal()
+
+    def __init__(self, filter: str = "YAML files (*.yaml *.yml)", parent=None):
+        super().__init__(parent)
+        self._filter = filter
+
+        layout = QHBoxLayout(self)
+        self.lineEdit = QLineEdit(self)
+        self.button_browse = QToolButton(self)
+        self.button_browse.setText("...")
+        self.button_browse.setMaximumWidth(80)
+        layout.addWidget(self.lineEdit)
+        layout.addWidget(self.button_browse)
+
+        self.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        self.button_browse.clicked.connect(self.browse_file)
+        self.lineEdit.textChanged.connect(self.textChanged.emit)
+        self.lineEdit.editingFinished.connect(self.editingFinished.emit)
+
+    def browse_file(self):
+        start = self.lineEdit.text() or ""
+        path, _ = QFileDialog.getOpenFileName(self, "Select File", start, self._filter)
+        if path:
+            self.lineEdit.setText(path)
+            self.textChanged.emit(path)
+            self.editingFinished.emit()
+
+    def text(self) -> str:
+        return self.lineEdit.text()
+
+    def setText(self, text: str) -> None:
+        self.lineEdit.setText(text)
+
+
+def _create_combobox_control(value: Union[str, int, float, Enum],
                              items: list, 
                              units: Optional[str], 
                              format_fn: Optional[Callable] = None, 
@@ -132,15 +175,21 @@ def _create_combobox_control(value: Union[str, int, float, Enum],
 
     # find the closest match to the current value (should only be used for numerical values)
     idx = control.findData(value)
-    if idx == -1:
+    if idx == -1 and len(items) > 0:
         # get the closest value
         closest_value = min(items, key=lambda x: abs(x - value))
         idx = control.findData(closest_value)
+
     if idx == -1:
-        logging.debug(f"Warning: No matching item or nearest found for {items} with value {value}. Using first item.")
-        idx = 0
-    control.setCurrentIndex(idx)
-    control.installEventFilter(WheelBlocker(parent=control))
+        if len(items) == 0:
+            logging.warning(f"No items available for combobox with value {value}")
+        else:
+            logging.debug(f"Warning: No matching item or nearest found for {items} with value {value}. Using first item.")
+            idx = 0
+
+    if idx >= 0:
+        control.setCurrentIndex(idx)
+    install_wheel_blocker(control)
 
     return control
 
@@ -150,26 +199,61 @@ class ValueComboBox(QComboBox):
 
     def __init__(
         self,
-        items: list,
+        items: Optional[list] = None,
         value=None,
         unit: Optional[str] = None,
         format_fn: Optional[Callable] = None,
+        decimals: int = 1,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        for item in items:
-            if isinstance(item, (float, int)):
-                item_str = format_value(val=item, unit=unit, precision=1)
-            elif isinstance(item, Enum):
-                item_str = item.name
-            elif format_fn is not None:
-                item_str = format_fn(item)
-            else:
-                item_str = str(item)
-            self.addItem(item_str, item)
-        self.installEventFilter(WheelBlocker(parent=self))
+        self._unit = unit
+        self._format_fn = format_fn
+        self._decimals = decimals
+        if items:
+            self.add_values(items)
+        install_wheel_blocker(self)
         if value is not None:
             self.set_value(value)
+
+    def _format_item(self, item) -> str:
+        """Render an item for display, using the unit/format_fn given at construction."""
+        if isinstance(item, (float, int)):
+            return format_value(val=item, unit=self._unit, precision=self._decimals)
+        if isinstance(item, Enum):
+            return item.name
+        if self._format_fn is not None:
+            return self._format_fn(item)
+        return str(item)
+
+    def add_value(self, item) -> None:
+        """Append a single item, storing the raw value as item data."""
+        self.addItem(self._format_item(item), item)
+
+    def add_values(self, items) -> None:
+        """Append several items."""
+        for item in items:
+            self.add_value(item)
+
+    def set_values(self, items, value=None, keep_selection: bool = True) -> None:
+        """Replace all items.
+
+        By default the current selection is preserved if it survives the swap —
+        repopulating a combobox should not silently change what is selected.
+        Falls back to *value*, else leaves the default (first) item. Signals are
+        suppressed during the swap so listeners see one change at most.
+        """
+        previous = self.value() if keep_selection else None
+        blocked = self.blockSignals(True)
+        try:
+            self.clear()
+            self.add_values(items)
+        finally:
+            self.blockSignals(blocked)
+
+        target = value if value is not None else previous
+        if target is not None:
+            self.set_value(target)
 
     def set_value(self, value) -> None:
         """Select the item matching value; falls back to closest numeric match."""
@@ -187,6 +271,35 @@ class ValueComboBox(QComboBox):
         return self.currentData()
 
 
+class IntegerValueSpinBox(QSpinBox):
+    """QSpinBox with sensible defaults, WheelBlocker, and None-safe configuration."""
+
+    def __init__(
+        self,
+        suffix: Optional[str] = None,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+        step: Optional[int] = None,
+        tooltip: Optional[str] = None,
+        no_buttons: bool = False,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        if suffix:
+            self.setSuffix(f" {suffix}")
+        self.setRange(
+            minimum if minimum is not None else 0,
+            maximum if maximum is not None else 1000000,
+        )
+        self.setSingleStep(step if step is not None else 1)
+        if tooltip:
+            self.setToolTip(tooltip)
+        if no_buttons:
+            self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.setKeyboardTracking(False)
+        install_wheel_blocker(self)
+
+
 class ValueSpinBox(QDoubleSpinBox):
     """QDoubleSpinBox with sensible defaults, WheelBlocker, and None-safe configuration."""
 
@@ -198,6 +311,7 @@ class ValueSpinBox(QDoubleSpinBox):
         step: Optional[float] = None,
         decimals: Optional[int] = None,
         tooltip: Optional[str] = None,
+        no_buttons: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -208,8 +322,10 @@ class ValueSpinBox(QDoubleSpinBox):
         self.setDecimals(decimals if decimals is not None else 3)
         if tooltip:
             self.setToolTip(tooltip)
+        if no_buttons:
+            self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.setKeyboardTracking(False)
-        self.installEventFilter(WheelBlocker(parent=self))
+        install_wheel_blocker(self)
 
 
 @dataclass
@@ -427,9 +543,9 @@ class TitledPanel(QWidget):
         self._header_layout = QHBoxLayout(self._header)
         self._header_layout.setContentsMargins(8, 3, 4, 3)
         self._header_layout.setSpacing(4)
-        title_label = QLabel(title)
-        title_label.setStyleSheet("font-weight: bold; background: transparent;")
-        self._header_layout.addWidget(title_label)
+        self._title_label = QLabel(title)
+        self._title_label.setStyleSheet("font-weight: bold; background: transparent;")
+        self._header_layout.addWidget(self._title_label)
         self._header_layout.addStretch()
 
         # Collapse toggle — always the last item in the header; checked=expanded
@@ -456,14 +572,26 @@ class TitledPanel(QWidget):
         if content is not None:
             self.set_content(content)
 
+    def collapse(self) -> None:
+        """Collapse the panel body."""
+        self._btn_collapse.setChecked(False)
+
+    def expand(self) -> None:
+        """Expand the panel body."""
+        self._btn_collapse.setChecked(True)
+
     def _on_collapse_toggled(self, expanded: bool) -> None:
         # Non-collapsible panels are always expanded
         if not self._collapsible:
             expanded = True
         self._body.setVisible(expanded)
         icon = "mdi:chevron-up" if expanded else "mdi:chevron-down"
-        self._btn_collapse.setIcon(QIconifyIcon(icon, color=stylesheets.GRAY_ICON_COLOR))
+        self._btn_collapse.setIcon(fibsem_icon(icon, color=stylesheets.GRAY_ICON_COLOR))
         self._btn_collapse.setToolTip("Collapse" if expanded else "Expand")
+
+    def set_title(self, title: str) -> None:
+        """Update the panel header title text."""
+        self._title_label.setText(title)
 
     def add_header_widget(self, widget: QWidget) -> None:
         """Add a widget to the right side of the header, before the collapse button."""
@@ -478,37 +606,50 @@ class TitledPanel(QWidget):
 
 
 class _SpinnerLabel(QLabel):
-    """Rotating icon label used as a lightweight acquisition progress indicator."""
+    """Spinning icon label used as a lightweight acquisition progress indicator.
+
+    Backed by qtawesome's native ``Spin`` animation: the icon engine rotates the
+    glyph and repaints this widget on a timer, so there is no manual rotation
+    bookkeeping. The animation timer is created lazily on first paint, so we let
+    it ``autostart`` and drive visibility via :meth:`start`/:meth:`stop`.
+    """
 
     def __init__(self, icon_name="mdi:loading", color="#4fc3f7", size=24,
                  step_deg=20, interval_ms=40, parent=None):
         super().__init__(parent)
-        self._pixmap = QIconifyIcon(icon_name, color=color).pixmap(size, size)
-        self._angle = 0
-        self._step = step_deg
-        self._timer = QTimer(self)
-        self._timer.setInterval(interval_ms)
-        self._timer.timeout.connect(self._tick)
+        self._spin = qta.Spin(self, interval=interval_ms, step=step_deg)
+        self._icon = fibsem_icon(icon_name, color=color, animation=self._spin)
+        self._active = False
         self.setFixedSize(size, size)
         self.setAlignment(Qt.AlignCenter)
-        self._render()
         self.setStyleSheet("background: transparent;")
 
-    def _tick(self):
-        self._angle = (self._angle + self._step) % 360
-        self._render()
-
-    def _render(self):
-        t = QTransform().rotate(self._angle)
-        self.setPixmap(self._pixmap.transformed(t, Qt.SmoothTransformation))
+    def paintEvent(self, event):
+        # only draw (and thereby drive the animation) while active
+        if not self._active:
+            return
+        painter = QPainter(self)
+        try:
+            self._icon.paint(painter, self.rect())
+        finally:
+            painter.end()
 
     def start(self):
-        self._timer.start()
+        self._active = True
+        # first paint registers the widget with the Spin (autostart=True) and
+        # starts its timer; _spin.start() then resumes it on a start-after-stop.
+        self.update()
+        self._spin.start()
 
     def stop(self):
-        self._timer.stop()
-        self._angle = 0
-        self._render()
+        self._active = False
+        self._spin.stop()
+        self.update()        # repaint blank
+
+    def clear(self):
+        # blanking the spinner implies stopping its animation
+        self.stop()
+        super().clear()
 
 
 class IconToolButton(QToolButton):
@@ -574,14 +715,14 @@ class IconToolButton(QToolButton):
             super().setChecked(checked)
             self._on_toggled(checked)
         else:
-            self.setIcon(QIconifyIcon(self._icon, color=self._color))
+            self.setIcon(fibsem_icon(self._icon, color=self._color))
             if tooltip:
                 self.setToolTip(tooltip)
 
     def _on_toggled(self, checked: bool) -> None:
         icon = self._checked_icon if checked else self._icon
         color = self._checked_color if checked else self._color
-        self.setIcon(QIconifyIcon(icon, color=color))
+        self.setIcon(fibsem_icon(icon, color=color))
         tip = self._checked_tooltip if checked else self._tooltip
         if tip is not None:
             self.setToolTip(tip)
@@ -675,8 +816,6 @@ class TaskNameListWidget(QWidget):
     def _restore_selection(self, names: List[str], preferred: str) -> None:
         if preferred and preferred in names:
             self.select(preferred)
-        elif "Rough Milling" in names:
-            self.select("Rough Milling")
         elif self._list.count() > 0:
             self._list.setCurrentRow(0)
 
@@ -762,7 +901,7 @@ class _LamellaRow(QWidget):
 
         # Direct action buttons (replaces "…" dropdown)
         self.btn_move_to = QToolButton()
-        self.btn_move_to.setIcon(QIconifyIcon("mdi:crosshairs-gps", color=stylesheets.GRAY_ICON_COLOR))
+        self.btn_move_to.setIcon(fibsem_icon(ICON_MOVE_TO_POSITION, color=stylesheets.GRAY_ICON_COLOR))
         self.btn_move_to.setToolTip("Move to Position")
         self.btn_move_to.setFixedSize(_LAMELLA_BTN_SIZE)
         self.btn_move_to.setStyleSheet(stylesheets.TOOLBUTTON_ICON_STYLESHEET)
@@ -770,7 +909,7 @@ class _LamellaRow(QWidget):
         layout.addWidget(self.btn_move_to)
 
         self.btn_edit = QToolButton()
-        self.btn_edit.setIcon(QIconifyIcon("mdi:pencil", color=stylesheets.GRAY_ICON_COLOR))
+        self.btn_edit.setIcon(fibsem_icon("mdi:pencil", color=stylesheets.GRAY_ICON_COLOR))
         self.btn_edit.setToolTip("Edit Lamella")
         self.btn_edit.setFixedSize(_LAMELLA_BTN_SIZE)
         self.btn_edit.setStyleSheet(stylesheets.TOOLBUTTON_ICON_STYLESHEET)
@@ -778,7 +917,7 @@ class _LamellaRow(QWidget):
         layout.addWidget(self.btn_edit)
 
         self.btn_update = QToolButton()
-        self.btn_update.setIcon(QIconifyIcon("mdi:map-marker-check", color=stylesheets.GRAY_ICON_COLOR))
+        self.btn_update.setIcon(fibsem_icon(ICON_UPDATE_POSITION, color=stylesheets.GRAY_ICON_COLOR))
         self.btn_update.setToolTip("Update Position")
         self.btn_update.setFixedSize(_LAMELLA_BTN_SIZE)
         self.btn_update.setStyleSheet(stylesheets.TOOLBUTTON_ICON_STYLESHEET)
@@ -791,13 +930,17 @@ class _LamellaRow(QWidget):
 
         # Remove button
         self.btn_remove = QToolButton()
-        self.btn_remove.setIcon(QIconifyIcon("mdi:trash-can-outline", color=stylesheets.GRAY_ICON_COLOR))
+        self.btn_remove.setIcon(fibsem_icon("mdi:trash-can-outline", color=stylesheets.GRAY_ICON_COLOR))
         self.btn_remove.setToolTip("Remove")
         self.btn_remove.setFixedSize(_LAMELLA_BTN_SIZE)
         self.btn_remove.setStyleSheet(stylesheets.TOOLBUTTON_ICON_STYLESHEET)
         self.btn_remove.clicked.connect(self._on_remove_clicked)
         self.btn_remove.setVisible(False)
         layout.addWidget(self.btn_remove)
+
+        # live-update the description tooltip when it changes (e.g. edited in the
+        # Selected Lamella panel). type: ignore because @evented adds .events dynamically.
+        self.lamella.events.description.connect(self.refresh)  # type: ignore[union-attr]
 
         self.refresh()
 
@@ -808,13 +951,13 @@ class _LamellaRow(QWidget):
             return
         menu = QMenu(self)
         action_none = menu.addAction(
-            QIconifyIcon("mdi:check-circle", color=stylesheets.GREEN_COLOR), "No defect"
+            fibsem_icon("mdi:check-circle", color=stylesheets.GREEN_COLOR), "No defect"
         )
         action_rework = menu.addAction(
-            QIconifyIcon("mdi:refresh-circle", color=stylesheets.DEFECT_ORANGE_COLOR), "Rework required"
+            fibsem_icon("mdi:refresh-circle", color=stylesheets.DEFECT_ORANGE_COLOR), "Rework required"
         )
         action_failure = menu.addAction(
-            QIconifyIcon("mdi:close-circle", color=stylesheets.DEFECT_RED_COLOR), "Failure"
+            fibsem_icon("mdi:close-circle", color=stylesheets.DEFECT_RED_COLOR), "Failure"
         )
         chosen = menu.exec_(self.btn_defect.mapToGlobal(self.btn_defect.rect().bottomLeft()))
         if chosen == action_none:
@@ -838,13 +981,14 @@ class _LamellaRow(QWidget):
 
     def refresh(self) -> None:
         self.name_label.setText(self.lamella.name)
+        self.setToolTip(self.lamella.description or "")
         text, style = _lamella_status_text(self.lamella)
         self.status_label.setText(text)
         self.status_label.setStyleSheet(style)
         # Update defect icon if visible
         if self.btn_defect.isVisible():
             icon_name, icon_color, tooltip = _lamella_defect_icon(self.lamella)
-            self.btn_defect.setIcon(QIconifyIcon(icon_name, color=icon_color))
+            self.btn_defect.setIcon(fibsem_icon(icon_name, color=icon_color))
             self.btn_defect.setToolTip(tooltip)
 
 
@@ -1016,7 +1160,7 @@ class LamellaNameListWidget(QWidget):
             # Set icon directly — row.refresh() won't work here because
             # isVisible() returns False before the row is parented via setItemWidget
             icon_name, icon_color, tooltip = _lamella_defect_icon(row.lamella)
-            row.btn_defect.setIcon(QIconifyIcon(icon_name, color=icon_color))
+            row.btn_defect.setIcon(fibsem_icon(icon_name, color=icon_color))
             row.btn_defect.setToolTip(tooltip)
 
     # ------------------------------------------------------------------

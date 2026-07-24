@@ -14,7 +14,11 @@ from fibsem.applications.autolamella.structures import (
     AutoLamellaTaskProtocol,
     Experiment,
 )
-from fibsem.config import load_user_preferences, save_user_preferences
+from fibsem.config import (
+    add_recent_experiment,
+    load_user_preferences,
+    save_user_preferences,
+)
 from fibsem.ui import utils as fui
 from fibsem.ui.stylesheets import (
     PRIMARY_BUTTON_STYLESHEET,
@@ -87,7 +91,22 @@ class AutoLamellaCreateExperimentWidget(QtWidgets.QDialog):
 
         # Experiment Directory
         self.lineEdit_experiment_directory = QDirectoryLineEdit()
-        self.lineEdit_experiment_directory.setText(str(cfg.LOG_PATH))
+        prefs = load_user_preferences()
+        pref_dir = prefs.experiment.default_experiment_directory
+        if pref_dir and os.path.isdir(pref_dir):
+            self.lineEdit_experiment_directory.setText(pref_dir)
+        else:
+            if pref_dir:
+                logging.warning(f"Preference default_experiment_directory '{pref_dir}' does not exist; using default.")
+            self.lineEdit_experiment_directory.setText(str(cfg.LOG_PATH))
+
+        exp_prefs = prefs.experiment
+        if exp_prefs.user:
+            self.lineEdit_experiment_user.setText(exp_prefs.user)
+        if exp_prefs.project:
+            self.lineEdit_experiment_project.setText(exp_prefs.project)
+        if exp_prefs.organisation:
+            self.lineEdit_experiment_organisation.setText(exp_prefs.organisation)
 
         exp_form_layout.addRow("Name", self.lineEdit_experiment_name)
         exp_form_layout.addRow("Description", self.lineEdit_experiment_description)
@@ -211,20 +230,30 @@ class AutoLamellaCreateExperimentWidget(QtWidgets.QDialog):
             self.label_validation_warning.setText("")
 
     def _load_default_protocol(self):
-        """Load the default task protocol."""
-        if os.path.exists(cfg.TASK_PROTOCOL_PATH):
-            try:
-                self.protocol = AutoLamellaTaskProtocol.load(str(cfg.TASK_PROTOCOL_PATH))
-                self.protocol_path = str(cfg.TASK_PROTOCOL_PATH)
-                self._update_protocol_display()
-                logging.info(f"Default protocol loaded from {cfg.TASK_PROTOCOL_PATH}")
-            except Exception as e:
-                logging.error(f"Failed to load default protocol: {e}")
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Protocol Load Error",
-                    "The default protocol file could not be loaded. It may be corrupted or incorrectly formatted.\n\nPlease select a valid protocol file manually."
-                )
+        """Load the default task protocol, preferring the path set in user preferences."""
+        prefs = load_user_preferences()
+        pref_protocol = prefs.experiment.default_protocol_path
+        if pref_protocol and os.path.isfile(pref_protocol):
+            protocol_path_to_load = pref_protocol
+        else:
+            if pref_protocol:
+                logging.warning(f"Preference default_protocol_path '{pref_protocol}' does not exist; using default.")
+            if not os.path.exists(cfg.TASK_PROTOCOL_PATH):
+                return
+            protocol_path_to_load = str(cfg.TASK_PROTOCOL_PATH)
+
+        try:
+            self.protocol = AutoLamellaTaskProtocol.load(protocol_path_to_load)
+            self.protocol_path = protocol_path_to_load
+            self._update_protocol_display()
+            logging.info(f"Default protocol loaded from {protocol_path_to_load}")
+        except Exception as e:
+            logging.error(f"Failed to load default protocol: {e}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Protocol Load Error",
+                "The default protocol file could not be loaded. It may be corrupted or incorrectly formatted.\n\nPlease select a valid protocol file manually."
+            )
 
     def _select_protocol(self):
         """Open dialog to select a protocol file."""
@@ -384,9 +413,11 @@ class AutoLamellaCreateExperimentWidget(QtWidgets.QDialog):
             logging.info(f"Experiment '{experiment_name}' created successfully at {self.experiment.path}")
             logging.info(f"Protocol saved to {protocol_save_path}")
 
-            # Save last used experiment path
+            # Save last used experiment path + record in the recent quick-select
+            # list (single load/save cycle).
             prefs = load_user_preferences()
-            prefs.paths.last_experiment_path = str(self.experiment.path)
+            prefs.experiment.last_experiment_path = str(self.experiment.path)
+            add_recent_experiment(prefs, os.path.join(self.experiment.path, "experiment.yaml"))
             save_user_preferences(prefs)
 
             # Accept the dialog

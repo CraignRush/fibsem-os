@@ -28,6 +28,7 @@ import numpy as np
 
 from fibsem import acquire, alignment, calibration, constants, utils
 from fibsem import config as fcfg
+from fibsem.cancellation import OperationCancelledError
 from fibsem.applications.autolamella.protocol.constants import (
     FIDUCIAL_KEY,
     MILL_POLISHING_KEY,
@@ -64,6 +65,7 @@ from fibsem.detection.detection import (
     LamellaTopEdge,
     VolumeBlockCentre,
 )
+from fibsem.fm.structures import ChannelSettings
 from fibsem.microscope import FibsemMicroscope
 from fibsem.milling.patterning.utils import get_pattern_reduced_area
 from fibsem.milling.tasks import FibsemMillingTaskConfig, run_milling_task
@@ -137,10 +139,21 @@ class AutoLamellaTask(ABC):
         try:
             self._run()
         except Exception as e:
-            self._fire_hook("task_failed", error=str(e))
+            # A user Stop is a cancellation, not a failure — fire the distinct hook so it
+            # notifies as "cancelled" (warning) rather than "FAILED" (error).
+            self._fire_hook("task_cancelled" if self._is_cancellation(e) else "task_failed",
+                            error=str(e))
             raise
         self.post_task()
         self._fire_hook("task_completed")
+
+    def _is_cancellation(self, exc: Exception) -> bool:
+        """Whether ``exc`` is a user Stop rather than a genuine failure: it surfaces as
+        OperationCancelledError (milling / autofocus) or InterruptedError (_check_for_abort),
+        or the task manager's stop event is set."""
+        if isinstance(exc, (OperationCancelledError, InterruptedError)):
+            return True
+        return bool(getattr(getattr(self, "task_manager", None), "is_stopped", False))
 
     def _fire_hook(self, event: str, error: Optional[str] = None) -> None:
         hook_manager = getattr(self.task_manager, "hook_manager", None)
@@ -235,6 +248,22 @@ class AutoLamellaTask(ABC):
         """Check if the workflow has been aborted from the UI, and raise an InterruptedError if so."""
         if self._stop_event is not None and self._stop_event.is_set():
             raise InterruptedError("Workflow aborted by user.")
+
+    def _update_fluorescence_pose(self) -> None:
+        """Refresh the lamella's recorded fluorescence pose from the current microscope state.
+
+        The configured objective (focus) position is preserved: get_microscope_state()
+        does not capture the objective position, so overwriting the pose here (and
+        re-reading the live objective position) previously wiped the user's configured
+        focus.
+        """
+        configured_objective_position = (
+            self.lamella.fluorescence_pose.objective_position
+            if self.lamella.fluorescence_pose is not None
+            else None
+        )
+        self.lamella.fluorescence_pose = self.microscope.get_microscope_state()
+        self.lamella.fluorescence_pose.objective_position = configured_objective_position
 
     def update_milling_config_ui(self,
                                  milling_config: FibsemMillingTaskConfig,
@@ -343,26 +372,38 @@ class AutoLamellaTask(ABC):
 
         # load reference image, align
         ref_image = FibsemImage.load(full_filename)
-        FEATURE_USE_ALIGNMENT_CONVERGENCE_METHOD = False
-        if FEATURE_USE_ALIGNMENT_CONVERGENCE_METHOD:
-            alignment.align_until_converged(microscope=self.microscope, 
-                                            ref_image=ref_image, 
-                                    beam_type=BeamType.ION,
-                                    use_autocontrast=True,
-                                    max_steps=5, 
-                                    minimum_response=0.5,
-                                    stop_event=self._stop_event,
-                                    save_plot=True,
-                                    plot_title=f"{self.lamella.name} - {self.task_name}")
-            return
         alignment.multi_step_alignment_v2(microscope=self.microscope,
                                         ref_image=ref_image,
-                                        beam_type=BeamType.ION,
-                                        alignment_current=None,
                                         use_autocontrast=True,
                                         steps=MAX_ALIGNMENT_ATTEMPTS,
                                         stop_event=self._stop_event,
-                                        plot_title=f"{self.lamella.name} - {self.task_name}")
+                                        run_name=f"{self.lamella.name} - {self.task_name}")
+
+    def _run_autofocus(self, beam_type, hfw: float = None) -> None:
+        """Run the image-based autofocus sweep, saving diagnostics to the lamella path."""
+        from fibsem.autofunctions.autofocus import run_auto_focus, AutoFocusSettings, FocusSweepPass
+        settings = AutoFocusSettings(
+            method="tenengrad",
+            passes=[
+                FocusSweepPass(search_range=1e-3, step_size=100e-6),
+                FocusSweepPass(search_range=100e-6, step_size=10e-6),
+            ],
+            reduced_area=FibsemRectangle(0.25, 0.25, 0.5, 0.5),
+            use_autocontrast=True)
+        self.log_status_message("AUTOFOCUS", f"Running autofocus ({beam_type.name})...")
+        result = run_auto_focus(
+            self.microscope,
+            beam_type=beam_type,
+            hfw=hfw or self.image_settings.hfw,
+            settings=settings,
+        )
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        result.save(path=os.path.join(self.lamella.path, "autofunctions"), name=f"{self.task_name}_autofocus_{ts}")
+        self.log_status_message(
+            "AUTOFOCUS",
+            f"Autofocus (image-based): WD={result.working_distance*1e3:.3f}mm score={result.focus_score:.2f}",
+            f"Autofocus complete: WD={result.working_distance*1e3:.3f}mm",
+        )
 
     def _acquire_reference_image(self, image_settings: ImageSettings, filename: Optional[str] = None, field_of_view: float = 150e-6) -> None:
         """Acquire a reference image with given field of view."""
@@ -494,6 +535,20 @@ class AutoLamellaTask(ABC):
                                                 msg="Drag to edit the Alignment Area. Press Continue when done.",
                                                 validate=self.validate)
 
+    def set_fluorescence_channels_ui(self, channel_settings: List[ChannelSettings]) -> None:
+        """Set the fluorescence channel settings in the fluorescence widget."""
+        if self.parent_ui is None:
+            return
+
+        info = {
+            "msg": "Updating Fluorescence Channel Settings",
+            "fluorescence_channel_settings": deepcopy(channel_settings),
+        }
+
+        self.parent_ui.WAITING_FOR_UI_UPDATE = True
+        self.parent_ui.workflow_update_signal.emit(info) # type: ignore
+        while self.parent_ui.WAITING_FOR_UI_UPDATE:
+            time.sleep(0.5)
 
 def get_task_supervision(task_name: str,
                     parent_ui: Optional['AutoLamellaUI'] = None) -> bool:

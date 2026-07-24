@@ -3,13 +3,20 @@
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
+import fibsem.config as fcfg
+from fibsem.constants import DATETIME_DISPLAY_AMPM
+import pandas as pd
+
 from fibsem.applications.autolamella.structures import AutoLamellaTaskStatus
+from fibsem.cancellation import OperationCancelledError
 from fibsem.applications.autolamella.workflows.tasks.hooks import HookContext, HookEvent, HookManager
 from fibsem.applications.autolamella.workflows.tasks.queue import TaskQueue
 from fibsem.applications.autolamella.workflows.ui import update_status_ui
 from fibsem.microscope import FibsemMicroscope
+from fibsem.utils import format_time_remaining
 
 if TYPE_CHECKING:
     from fibsem.applications.autolamella.structures import Experiment, Lamella
@@ -101,6 +108,15 @@ class TaskManager:
                 )
                 continue
 
+            # Wait until the task's scheduled start time, if set and in the future
+            # (only when the scheduled-tasks feature is enabled; otherwise any
+            # saved scheduled_at is left dormant and the task runs immediately).
+            scheduled_at = self.experiment.task_protocol.workflow_config.get_scheduled_at(item.task_name)
+            if scheduled_at is not None and fcfg.FEATURE_SCHEDULED_TASKS_ENABLED:
+                self._wait_until_scheduled(scheduled_at, item.task_name, lamella)
+                if self.is_stopped:
+                    break
+
             # Emit InProgress status
             self._emit_status(
                 task_name=item.task_name,
@@ -132,9 +148,42 @@ class TaskManager:
                 msg=msg,
             )
 
+        # if the objective is inserted, retract for safety
+        if self.microscope.fm is not None and self.microscope.fm.objective.state == "Inserted":
+            self.microscope.fm.objective.retract()
+
         self._fire_workflow_hook(HookEvent.WORKFLOW_COMPLETED)
         update_status_ui(self.parent_ui, "", workflow_info="All tasks completed.")
         print(self.experiment.task_history_dataframe())
+
+    def build_run_summary_dataframe(self) -> pd.DataFrame:
+        """Build a per-run summary of attempted tasks from the queue snapshot.
+
+        One row per (lamella, task) attempted in this run, including skipped
+        tasks (which are absent from the experiment task history). The
+        completed_at and duration values are pulled from the lamella's task
+        history where available, and left blank for skipped tasks.
+        """
+        rows: List[dict] = []
+        for item in self.queue.items:
+            lamella = self.experiment.get_lamella_by_name(item.lamella_name)
+            completed_at = ""
+            duration = None
+            if lamella is not None:
+                # most recent matching history entry for this task
+                for task in reversed(lamella.task_history):
+                    if task.name == item.task_name:
+                        completed_at = task.completed_at
+                        duration = task.duration
+                        break
+            rows.append({
+                "lamella_name": item.lamella_name,
+                "task_name": item.task_name,
+                "task_status": item.status.name,
+                "completed_at": completed_at,
+                "duration": duration,
+            })
+        return pd.DataFrame(rows)
 
     def stop(self) -> None:
         """Signal the manager to stop after current task completes."""
@@ -150,6 +199,34 @@ class TaskManager:
         self.hook_manager.fire(HookContext(event=event))
 
     # --- Internal helpers ---
+
+    def _wait_until_scheduled(self, scheduled_at: datetime, task_name: str,
+                              lamella: 'Lamella') -> None:
+        """Block until ``scheduled_at`` is reached, emitting a periodic countdown.
+
+        The wait is interruptible: if ``stop()`` is called the loop exits early
+        and the caller skips running the task.
+        """
+        # Times are naive-local throughout, but a hand-edited/externally-produced
+        # protocol may carry a tz-aware scheduled_at. Normalize to naive-local so
+        # the subtraction against datetime.now() below doesn't raise TypeError.
+        if scheduled_at.tzinfo is not None:
+            scheduled_at = scheduled_at.astimezone().replace(tzinfo=None)
+        target_str = scheduled_at.strftime(DATETIME_DISPLAY_AMPM)
+        next_update = 0.0  # force an immediate first message
+        while not self.is_stopped:
+            remaining = (scheduled_at - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+
+            now = time.monotonic()
+            if now >= next_update:
+                msg = (f"Waiting until {target_str} to start {task_name} on "
+                       f"{lamella.name} ({format_time_remaining(remaining)} remaining).")
+                update_status_ui(self.parent_ui, "", status_bar=msg)
+                next_update = now + 15.0
+
+            time.sleep(min(1.0, remaining))
 
     def _should_skip(self, lamella: 'Lamella', task_name: str,
                      required_lamella: List[str]) -> Optional[str]:
@@ -214,9 +291,17 @@ class TaskManager:
             self.experiment.save()
             return None
         except Exception as e:
-            logging.warning(f"Error running task {task_name} for lamella {lamella.name}: {e}")
-            lamella.task_state.status = AutoLamellaTaskStatus.Failed
-            lamella.task_state.status_message = str(e)
+            # A user Stop surfaces as OperationCancelledError (milling) or InterruptedError
+            # (_check_for_abort); either way self.is_stopped is set by TaskManager.stop().
+            # Mark it Cancelled, not Failed — it isn't an error.
+            if self.is_stopped or isinstance(e, OperationCancelledError):
+                logging.info(f"Task {task_name} for lamella {lamella.name} cancelled by user.")
+                lamella.task_state.status = AutoLamellaTaskStatus.Cancelled
+                lamella.task_state.status_message = "Cancelled by user."
+            else:
+                logging.warning(f"Error running task {task_name} for lamella {lamella.name}: {e}")
+                lamella.task_state.status = AutoLamellaTaskStatus.Failed
+                lamella.task_state.status_message = str(e)
             self.experiment.save()
             return e
 

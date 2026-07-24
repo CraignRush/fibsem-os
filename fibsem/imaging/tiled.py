@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from copy import deepcopy
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -144,6 +144,27 @@ def order_tiles(tiles: list[TilePosition], strategy: TileOrderStrategy) -> list[
             row_tiles = list(reversed(row_tiles))
         result.extend(row_tiles)
     return result
+
+
+def validate_tile_stage_positions(
+    ordered: list[TilePosition],
+    tile_stage_positions: list[FibsemStagePosition],
+    limits: dict,
+) -> list[tuple[int, int]]:
+    """Return (row, col) pairs for any tile positions that exceed stage limits.
+
+    Args:
+        ordered: Tile grid positions in acquisition order.
+        tile_stage_positions: Projected stage position for each tile (same order).
+        limits: Dict[str, RangeLimit] from microscope._stage.limits.
+    Returns:
+        List of (row, col) tuples for out-of-bounds tiles (empty if all OK).
+    """
+    return [
+        (tile.row, tile.col)
+        for tile, sp in zip(ordered, tile_stage_positions)
+        if not sp.is_within_limits(limits, axes=["x", "y"])
+    ]
 
 
 def plot_tile_positions(
@@ -379,6 +400,16 @@ class TiledAcquisitionRunner:
         for tile, sp in zip(self._ordered, self._tile_stage_positions):
             logging.info(f"Tile ({tile.row}, {tile.col}) projected: {sp.pretty}")
 
+        out_of_bounds = validate_tile_stage_positions(
+            self._ordered, self._tile_stage_positions, self.microscope._stage.limits
+        )
+        if out_of_bounds:
+            details = ", ".join(f"({r},{c})" for r, c in out_of_bounds)
+            raise ValueError(
+                f"Overview acquisition grid extends beyond stage limits. "
+                f"{len(out_of_bounds)} tile(s) out of bounds: {details}"
+            )
+
         # EVERY_ROW is not well-defined for SPIRAL (rows are revisited non-sequentially),
         # so promote it to EVERY_TILE so focus is always fresh.
         if self._af_mode is AutoFocusMode.EVERY_ROW and settings.tile_order is TileOrderStrategy.SPIRAL:
@@ -459,19 +490,23 @@ class TiledAcquisitionRunner:
         signal = self.microscope.tiled_acquisition_signal
         total_tiles = self.settings.nrows * self.settings.ncols
         signal.emit({"msg": "Stitching Tiles", "counter": total_tiles, "total": total_tiles})
-        image = FibsemImage(data=self._canvas, metadata=self._first_image.metadata)
+        # deepcopy so the stitched image gets its OWN metadata snapshot — the edits below
+        # (hfw → total FOV, stitched resolution) must not mutate the caller's shared
+        # settings object or the first tile's metadata.
+        image = FibsemImage(data=self._canvas, metadata=deepcopy(self._first_image.metadata))
         if image.metadata is None:
             raise ValueError("Image metadata is not set. Cannot update metadata for stitched image.")
         image.metadata.microscope_state = deepcopy(self._start_state)
-        image.metadata.image_settings = self._image_settings
-        image.metadata.image_settings.hfw = deepcopy(float(self.settings.total_fov_x))
-        image.metadata.image_settings.resolution = deepcopy((self._canvas.shape[0], self._canvas.shape[1]))
+        image.metadata.image_settings = deepcopy(self._image_settings)
+        image.metadata.image_settings.hfw = float(self.settings.total_fov_x)
+        # resolution is (width, height); numpy canvas.shape is (height, width).
+        image.metadata.image_settings.resolution = (self._canvas.shape[1], self._canvas.shape[0])
 
         filename = os.path.join(image.metadata.image_settings.path, self._prev_label)  # type: ignore
         image.save(filename)
 
         if self._cryo:
-            from fibsem.imaging.autogamma import auto_gamma
+            from fibsem.autofunctions.gamma import auto_gamma
             image = auto_gamma(image, method="autogamma")
             filename = os.path.join(image.metadata.image_settings.path, f"{self._prev_label}-autogamma")  # type: ignore
             image.save(filename)
@@ -796,6 +831,8 @@ def plot_minimap(
         color: str = "cyan",
         show_scalebar: bool = False,
         show_names: bool = True,
+        show_descriptions: bool = False,
+        descriptions: Optional[Dict[str, str]] = None,
         show_grid_radius: bool = False,
         fontsize: int = 12,
         markersize: int = 20,
@@ -857,6 +894,7 @@ def plot_minimap(
                 "point": (pt.x, pt.y),
                 "color": c,
                 "label": pt.name,
+                "description": descriptions.get(pt.name, "") if descriptions else "",
             }
         )
 
@@ -890,6 +928,19 @@ def plot_minimap(
                     alpha=0.75,
                     clip_on=True,
                 )
+                # description as a smaller subtitle just below the name
+                if show_descriptions and entry["description"]:
+                    ax.annotate(
+                        entry["description"],
+                        xy=(x + 10, y - 10),
+                        xytext=(0, -(fontsize + 2)),
+                        textcoords="offset points",
+                        fontsize=max(6, int(round(fontsize * 0.7))),
+                        color=entry["color"],
+                        alpha=0.6,
+                        va="top",
+                        annotation_clip=True,
+                    )
 
     if show_scalebar:
         try:

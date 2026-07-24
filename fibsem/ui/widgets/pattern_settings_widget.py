@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -22,9 +23,11 @@ from fibsem.milling.patterning.patterns2 import BasePattern
 from fibsem.structures import BeamType, Point
 from fibsem.ui.widgets.custom_widgets import (
     FormRow,
+    QLineEdit,
     QFilePathLineEdit,
     ValueComboBox,
     ValueSpinBox,
+    IntegerValueSpinBox,
 )
 
 _HIDDEN_FIELDS = {"shapes"}
@@ -159,6 +162,9 @@ class FibsemPatternSettingsWidget(QWidget):
             dims = m.get("dimensions")
             effective_scale = (base_scale ** dims) if (base_scale and dims) else base_scale
 
+            if effective_scale is None:
+                effective_scale = 1
+
             if items == "dynamic":
                 cached = self.microscope.get_available_values_cached(
                     m["microscope_parameter"], BeamType.ION
@@ -167,24 +173,47 @@ class FibsemPatternSettingsWidget(QWidget):
                 control = ValueComboBox(items_list, value, m.get("unit"))
             elif items:
                 control = ValueComboBox(items, value, m.get("unit"))
-            elif m.get("filepath"):
-                control = QFilePathLineEdit()
+            elif type_ is str:
+                if m.get("filepath"):
+                    control = QFilePathLineEdit()
+                else:
+                    control = QLineEdit()
                 control.setText(str(value) if value else "")
             elif type_ is bool or isinstance(value, bool):
                 control = QCheckBox()
                 control.setChecked(bool(value))
-            elif isinstance(value, (float, int)):
+            elif type_ is int:
+                effective_scale = int(round(effective_scale))
+                suffix = (
+                    utils._get_display_unit(base_scale, m.get("unit"))
+                    if base_scale
+                    else (m.get("unit") or "")
+                )
+                # Ensure integer types don't have a step size under the effective scale or 1
+                step = max(m.get("step", 1), effective_scale)
+                control = IntegerValueSpinBox(
+                    suffix,
+                    m.get("minimum"),
+                    m.get("maximum"),
+                    step,
+                )
+                control.setValue(int(round(value * effective_scale)))
+            elif isinstance(value, (float, int)) or type_ is float:
                 suffix = (
                     utils._get_display_unit(base_scale, m.get("unit"))
                     if base_scale
                     else (m.get("unit") or "")
                 )
                 control = ValueSpinBox(
-                    suffix, m.get("minimum"), m.get("maximum"), m.get("step"), m.get("decimals")
+                    suffix,
+                    m.get("minimum"),
+                    m.get("maximum"),
+                    m.get("step"),
+                    m.get("decimals"),
                 )
-                display_val = value * effective_scale if effective_scale else value
-                control.setValue(display_val)
+                control.setValue(value * effective_scale)
             else:
+                logging.warning("Control for '%s' is unsupported", field_name)
                 continue  # unsupported type
 
             label = QLabel(label_text)
@@ -196,13 +225,16 @@ class FibsemPatternSettingsWidget(QWidget):
             # Connect signal
             if isinstance(control, ValueComboBox):
                 control.currentIndexChanged.connect(self._on_changed)
-            elif isinstance(control, ValueSpinBox):
+            elif isinstance(control, (ValueSpinBox, IntegerValueSpinBox)):
                 control.valueChanged.connect(self._on_changed)
             elif isinstance(control, QCheckBox):
                 control.toggled.connect(self._on_changed)
             elif isinstance(control, QFilePathLineEdit):
                 control.editingFinished.connect(self._on_changed)
-
+            else:
+                raise TypeError(
+                    f"Unsupported control type '{type(control)}' in FibsemPatternSettingsWidget"
+                )
             self._rows.append(FormRow(
                 label=label,
                 control=control,
@@ -266,10 +298,21 @@ class FibsemPatternSettingsWidget(QWidget):
             elif isinstance(row.control, ValueSpinBox):
                 val = row.control.value()
                 setattr(pattern, row.field, val / row.scale if row.scale else val)
+            elif isinstance(row.control, IntegerValueSpinBox):
+                val = row.control.value()
+                setattr(
+                    pattern,
+                    row.field,
+                    int(round(val / row.scale if row.scale else val)),
+                )
             elif isinstance(row.control, QCheckBox):
                 setattr(pattern, row.field, row.control.isChecked())
             elif isinstance(row.control, QFilePathLineEdit):
                 setattr(pattern, row.field, row.control.text())
+            else:
+                raise TypeError(
+                    f"Unsupported control type '{type(row.control)}' in FibsemPatternSettingsWidget"
+                )
         return pattern
 
     def set_pattern(self, pattern: BasePattern) -> None:
@@ -302,10 +345,18 @@ class FibsemPatternSettingsWidget(QWidget):
                 row.control.set_value(value)
             elif isinstance(row.control, ValueSpinBox):
                 row.control.setValue(value * row.scale if row.scale else value)
+            elif isinstance(row.control, IntegerValueSpinBox):
+                row.control.setValue(
+                    int(round(value * row.scale if row.scale else value))
+                )
             elif isinstance(row.control, QCheckBox):
                 row.control.setChecked(bool(value))
             elif isinstance(row.control, QFilePathLineEdit):
                 row.control.setText(str(value) if value else "")
+            else:
+                raise TypeError(
+                    f"Unsupported control type '{type(row.control)}' in FibsemPatternSettingsWidget"
+                )
         for row in self._rows:
             if not isinstance(row, _PointRow):
                 row.control.blockSignals(False)

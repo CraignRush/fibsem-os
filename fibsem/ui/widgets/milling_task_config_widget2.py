@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from superqt import QIconifyIcon
+from fibsem.ui.icon import fibsem_icon
 
 from fibsem import constants
 from fibsem.microscope import FibsemMicroscope
@@ -25,6 +25,8 @@ from fibsem.ui.widgets.milling_task_acquisition_settings_widget import (
     FibsemMillingTaskAcquisitionSettingsWidget,
 )
 
+if TYPE_CHECKING:
+    from fibsem.applications.autolamella.ui import AutoLamellaUI
 
 _WIDGET_CONFIG = {
     "name": {"default": "Milling Task", "placeholder": "Enter task name..."},
@@ -58,7 +60,7 @@ class MillingTaskConfigWidget2(QWidget):
         milling_task_config: Optional[FibsemMillingTaskConfig] = None,
         milling_enabled: bool = True,
         correlation_enabled: bool = True,
-        parent: Optional[QWidget] = None,
+        parent: Optional['AutoLamellaUI'] = None,
     ) -> None:
         super().__init__(parent)
         self.microscope = microscope
@@ -82,7 +84,7 @@ class MillingTaskConfigWidget2(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setWidget(content_widget)
         main_layout.addWidget(scroll_area)
 
@@ -116,9 +118,9 @@ class MillingTaskConfigWidget2(QWidget):
         core_grid.addWidget(self.label_instructions, 2, 0, 1, 2)
         core_grid.setColumnStretch(1, 1)
 
-        core_panel = TitledPanel("Milling Parameters", content=core_content)
-        core_panel._btn_collapse.setChecked(True)
-        layout.addWidget(core_panel)
+        self.core_panel = TitledPanel("Milling Parameters", content=core_content)
+        self.core_panel._btn_collapse.setChecked(True)
+        layout.addWidget(self.core_panel)
 
         # ── Alignment panel ──────────────────────────────────────────
         self.alignment_widget = FibsemMillingAlignmentWidget(
@@ -142,11 +144,11 @@ class MillingTaskConfigWidget2(QWidget):
             checked_tooltip="Hide advanced settings",
         )
 
-        alignment_panel = TitledPanel("Alignment", content=self.alignment_widget)
-        alignment_panel.add_header_widget(self._btn_enable_alignment)
-        alignment_panel.add_header_widget(self._btn_advanced_alignment)
-        alignment_panel._btn_collapse.setChecked(False)
-        layout.addWidget(alignment_panel)
+        self.alignment_panel = TitledPanel("Alignment", content=self.alignment_widget)
+        self.alignment_panel.add_header_widget(self._btn_enable_alignment)
+        self.alignment_panel.add_header_widget(self._btn_advanced_alignment)
+        self.alignment_panel._btn_collapse.setChecked(False)
+        layout.addWidget(self.alignment_panel)
 
         # ── Acquisition panel ────────────────────────────────────────
         self.acquisition_widget = FibsemMillingTaskAcquisitionSettingsWidget(
@@ -170,11 +172,11 @@ class MillingTaskConfigWidget2(QWidget):
             checked_tooltip="Hide advanced settings",
         )
 
-        acquisition_panel = TitledPanel("Acquisition", content=self.acquisition_widget)
-        acquisition_panel.add_header_widget(self._btn_enable_acquisition)
-        acquisition_panel.add_header_widget(self._btn_advanced_acquisition)
-        acquisition_panel._btn_collapse.setChecked(False)
-        layout.addWidget(acquisition_panel)
+        self.acquisition_panel = TitledPanel("Acquisition", content=self.acquisition_widget)
+        self.acquisition_panel.add_header_widget(self._btn_enable_acquisition)
+        self.acquisition_panel.add_header_widget(self._btn_advanced_acquisition)
+        self.acquisition_panel._btn_collapse.setChecked(False)
+        layout.addWidget(self.acquisition_panel)
 
         # ── Milling stages ───────────────────────────────────────────
         self.milling_stages_widget = FibsemMillingStagesWidget(
@@ -216,7 +218,7 @@ class MillingTaskConfigWidget2(QWidget):
 
     def _update_stage_count_icon(self, n: int) -> None:
         icon_name = "mdi:numeric-9-plus-box-outline" if n > 9 else f"mdi:numeric-{n}-box-outline"
-        self._btn_stage_count.setIcon(QIconifyIcon(icon_name, color=stylesheets.GRAY_ICON_COLOR))
+        self._btn_stage_count.setIcon(fibsem_icon(icon_name, color=stylesheets.GRAY_ICON_COLOR))
         self._btn_stage_count.setToolTip(f"{n} stage{'s' if n != 1 else ''}")
 
     def _emit_settings_changed(self) -> None:

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 import pandas as pd
 import petname
@@ -18,6 +18,7 @@ from psygnal.containers import EventedDict, EventedList
 
 from fibsem.applications.autolamella import config as cfg
 from fibsem.constants import TIME_DISPLAY_AMPM_SHORT
+from fibsem.correlation.config import CorrelationConfig
 from fibsem.applications.autolamella.protocol.constants import (
     FIDUCIAL_KEY,
     MICROEXPANSION_KEY,
@@ -42,6 +43,9 @@ from fibsem.structures import (
 )
 from fibsem.utils import configure_logging, format_duration
 
+if TYPE_CHECKING:
+    from fibsem.microscope import FibsemMicroscope
+
 
 
 
@@ -51,6 +55,7 @@ class AutoLamellaTaskStatus(Enum):
     Completed = auto()
     Failed = auto()
     Skipped = auto()
+    Cancelled = auto()  # aborted by the user (Stop), distinct from a genuine Failure
 
 
 @dataclass
@@ -229,11 +234,10 @@ class AutoLamellaTaskConfig(ABC):
 
     @property
     def estimated_time(self) -> float:
-        """Estimate the total milling time for this task configuration."""
-        total_time = 0.0
-        for milling_task in self.milling.values():
-            total_time += milling_task.estimated_time
-        return total_time
+        """Estimate the total time for this task (milling + reference imaging)."""
+        milling_time = sum(t.estimated_time for t in self.milling.values())
+        imaging_time = self.reference_imaging.estimated_time
+        return milling_time + imaging_time
     
     @property
     def imaging(self) -> ImageSettings:
@@ -339,6 +343,13 @@ class AutoLamellaWorkflowConfig:
                 return task.supervise
         return False
 
+    def get_scheduled_at(self, task_name: str) -> Optional[datetime]:
+        """Get the scheduled start time for a task, or None if not scheduled."""
+        for task in self.tasks:
+            if task.name == task_name:
+                return task.scheduled_at
+        return None
+
     def add_task(self, task: AutoLamellaTaskConfig) -> None:
         """Add a task to the workflow configuration."""
         self.tasks.append(AutoLamellaTaskDescription(name=task.task_name, 
@@ -421,6 +432,9 @@ class AutoLamellaTaskProtocol:
     workflow_config: AutoLamellaWorkflowConfig = field(default_factory=AutoLamellaWorkflowConfig)
     options: AutoLamellaWorkflowOptions = field(default_factory=AutoLamellaWorkflowOptions)
     lamella_defaults: LamellaDefaultConfig = field(default_factory=LamellaDefaultConfig)
+    # Experiment-global correlation config (FIB-298): a user-step config, not an
+    # automated task, so a peer field rather than an entry in task_config.
+    correlation: CorrelationConfig = field(default_factory=CorrelationConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -432,6 +446,7 @@ class AutoLamellaTaskProtocol:
             "workflow": self.workflow_config.to_dict(),
             "options": self.options.to_dict(),
             "lamella_defaults": self.lamella_defaults.to_dict(),
+            "correlation": self.correlation.to_dict(),
         }
 
     @classmethod
@@ -448,6 +463,8 @@ class AutoLamellaTaskProtocol:
             workflow_config=workflow_config,
             options=AutoLamellaWorkflowOptions.from_dict(data.get("options", {})),
             lamella_defaults=LamellaDefaultConfig.from_dict(data.get("lamella_defaults", {})),
+            # Missing on protocols saved before this field -> a default config.
+            correlation=CorrelationConfig.from_dict(data.get("correlation")),
         )
         if "_id" in data:
             protocol._id = data["_id"]
@@ -695,9 +712,9 @@ class Lamella:
     task_state: AutoLamellaTaskState = field(default_factory=AutoLamellaTaskState)
     task_history: List['AutoLamellaTaskState'] = field(default_factory=list)
     defect: DefectState = field(default_factory=DefectState)
-    objective_position: Optional[float] = None  # TODO: deprecate, use poses instead
     milling_angle: Optional[float] = None
     poi: Point = field(default_factory=lambda: Point(0,0))  # point of interest within lamella area (milling coordinate system)
+    description: str = ""  # free-text note about the lamella
 
     def __post_init__(self):
         # only make the dir, if the base path is actually set, 
@@ -789,7 +806,23 @@ class Lamella:
 
     @property
     def fluorescence_selected(self) -> bool:
-        return self.fluorescence_pose is not None and self.objective_position is not None
+        return self.fluorescence_pose is not None and self.fluorescence_pose.objective_position is not None
+
+    def update_milling_angle(self, microscope: "FibsemMicroscope") -> None:
+        """Recompute milling_angle from the milling-pose stage tilt.
+
+        The milling angle is derived from the stage tilt (plus the microscope pretilt /
+        column-tilt configuration), so it is kept consistent with the stored milling pose.
+        Leaves the existing value unchanged if the stage tilt/rotation is unavailable.
+        """
+        if microscope is None or self.milling_pose is None or self.milling_pose.stage_position is None:
+            return
+        try:
+            self.milling_angle = microscope.get_current_milling_angle(
+                stage_position=self.milling_pose.stage_position
+            )
+        except ValueError:
+            logging.debug(f"Could not compute milling angle for {self.name}: stage tilt/rotation unavailable")
 
     def to_dict(self):
         return {
@@ -803,9 +836,9 @@ class Lamella:
             "task_state": self.task_state.to_dict(),
             "task_history": [task.to_dict() for task in self.task_history],
             "defect": self.defect.to_dict(),
-            "objective_position": self.objective_position,
             "milling_angle": self.milling_angle,
             "poi": self.poi.to_dict(),
+            "description": self.description,
         }
 
     @property
@@ -819,11 +852,8 @@ class Lamella:
     @property
     def pretty_fm_name(self) -> str:
         """Generate a pretty name for the stage position."""
-        if self.objective_position is None:
-            objective_str = "N/A"
-        else:
-            objective_str = f"{self.objective_position * 1e3:.3f}mm"
-
+        obj_pos = self.fluorescence_pose.objective_position if self.fluorescence_pose is not None else None
+        objective_str = f"{obj_pos * 1e3:.3f}mm" if obj_pos is not None else "N/A"
         return f"{self.name} ({self.stage_position.x * 1e6:.1f}μm, {self.stage_position.y * 1e6:.1f}μm, {objective_str})"
 
     @classmethod
@@ -834,20 +864,27 @@ class Lamella:
 
         from fibsem.applications.autolamella.workflows.tasks import load_task_config
 
+        poses = {k: MicroscopeState.from_dict(v) for k, v in data.get("poses", {}).items()}
+        # backwards compat: migrate legacy top-level objective_position into fluorescence_pose
+        legacy_obj_pos = data.get("objective_position", None)
+        if legacy_obj_pos is not None and "FLUORESCENCE" in poses:
+            if poses["FLUORESCENCE"].objective_position is None:
+                poses["FLUORESCENCE"].objective_position = legacy_obj_pos
+
         return cls(
             petname=data["petname"],
             path=data["path"],
             alignment_area=alignment_area,
             number=data.get("number", data.get("number", 0)),
             _id=data.get("id", ""),
-            poses = {k: MicroscopeState.from_dict(v) for k, v in data.get("poses", {}).items()},
+            poses=poses,
             task_config=load_task_config(data.get("task_config", {})),
             task_state=AutoLamellaTaskState.from_dict(data.get("task_state", {})),
             task_history=[AutoLamellaTaskState.from_dict(task) for task in data.get("task_history", [])],
             defect=DefectState.from_dict(data.get("defect", {})),
-            objective_position=data.get("objective_position", None),
             milling_angle=data.get("milling_angle", None),
             poi=Point.from_dict(data.get("poi", {"x":0,"y":0})),
+            description=data.get("description", ""),
         )
 
     def load_reference_image(self, fname) -> FibsemImage:

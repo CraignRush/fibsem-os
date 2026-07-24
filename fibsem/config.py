@@ -3,6 +3,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List
 
 import yaml
 
@@ -73,14 +74,21 @@ LOG_PATH = os.path.join(BASE_PATH, "fibsem", "log")
 DATA_PATH = os.path.join(LOG_PATH, "data")
 DATA_ML_PATH: str = os.path.join(DATA_PATH, "ml")
 DATA_CC_PATH: str = os.path.join(DATA_PATH, "crosscorrelation")
-POSITION_PATH = os.path.join(CONFIG_PATH, "positions.yaml")
+POSITION_PATH = os.path.join(CONFIG_PATH, "saved-positions.yaml")
 USER_PREFERENCES_PATH = os.path.join(CONFIG_PATH, "user-preferences.yaml")
 MODELS_PATH = os.path.join(BASE_PATH, "fibsem", "segmentation", "models")
 MICROSCOPE_CONFIGURATION_PATH = os.path.join(
     CONFIG_PATH, "microscope-configuration.yaml"
 )
+# fluorescence settings persistence
+FM_CONFIGURATION_PATH = os.path.join(CONFIG_PATH, "fm-configuration.yaml")  # working state
+FM_RECENT_CHANNELS_PATH = os.path.join(CONFIG_PATH, "fm-recent-channels.yaml")  # recently-used channels
+COINCIDENCE_MILLING_CONFIG_PATH = os.path.join(CONFIG_PATH, "coincidence-milling-config.yaml")  # milling default
 SAMPLE_HOLDER_CONFIGURATION_PATH = os.path.join(
     CONFIG_PATH, "sample-holder.yaml"
+)
+DEFAULT_SAMPLE_HOLDER_CONFIGURATION_PATH = os.path.join(
+    CONFIG_PATH, "default-sample-holder.yaml"
 )
 
 # Alignment reference image filename
@@ -241,34 +249,49 @@ class DisplayPreferences:
     sound_enabled: bool = False
     toasts_enabled: bool = False
     border_enabled: bool = True
-    workflow_timeline_enabled: bool = True
     dev_mode: bool = False
 
 @dataclass
 class FeatureFlags:
-    minimap_plot_widget: bool = True
     lamella_position_on_live_view: bool = False
-    pose_controls: bool = False
-    display_grid_center_marker: bool = False
     viewer_movement_events: bool = False
-
-@dataclass
-class PathPreferences:
-    default_experiment_directory: str = ""
-    last_experiment_path: str = ""
-    default_protocol_path: str = ""
+    coincidence_milling_enabled: bool = False
+    sample_holder_widget: bool = False
+    scheduled_tasks: bool = False
+    bug_report_enabled: bool = False
 
 @dataclass
 class MovementPreferences:
     acquire_sem_after_stage_movement: bool = True
     acquire_fib_after_stage_movement: bool = True
 
+# Maximum number of recent experiments to remember for quick-select
+MAX_RECENT_EXPERIMENTS = 10
+
+
+@dataclass
+class ExperimentPreferences:
+    default_experiment_directory: str = ""
+    default_protocol_path: str = ""
+    last_experiment_path: str = ""
+    recent_experiments: List[str] = field(default_factory=list)
+    user: str = ""
+    project: str = ""
+    organisation: str = ""
+
+@dataclass
+class ReportingPreferences:
+    contact_email: str = ""
+    crash_reporting_enabled: bool = False
+    sentry_dsn: str = ""
+
 @dataclass
 class UserPreferences:
     display: DisplayPreferences = field(default_factory=DisplayPreferences)
     features: FeatureFlags = field(default_factory=FeatureFlags)
-    paths: PathPreferences = field(default_factory=PathPreferences)
     movement: MovementPreferences = field(default_factory=MovementPreferences)
+    experiment: ExperimentPreferences = field(default_factory=ExperimentPreferences)
+    reporting: ReportingPreferences = field(default_factory=ReportingPreferences)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -276,24 +299,24 @@ class UserPreferences:
     @classmethod
     def from_dict(cls, d: dict) -> "UserPreferences":
         """Reconstruct from a dict, handling both nested and legacy flat formats."""
-        # If the dict has nested sub-dicts, reconstruct directly
-        if any(k in d for k in ("display", "features", "paths", "movement")):
+        if any(k in d for k in ("display", "features", "movement", "experiment", "reporting")):
             return cls(
                 display=_sub_from_dict(DisplayPreferences, d.get("display", {})),
                 features=_sub_from_dict(FeatureFlags, d.get("features", {})),
-                paths=_sub_from_dict(PathPreferences, d.get("paths", {})),
                 movement=_sub_from_dict(MovementPreferences, d.get("movement", {})),
+                experiment=_sub_from_dict(ExperimentPreferences, d.get("experiment", {})),
+                reporting=_sub_from_dict(ReportingPreferences, d.get("reporting", {})),
             )
-        # Legacy flat format (4-key YAML from previous version)
+        # Legacy flat format
         prefs = cls()
         if "acquire_sem_after_stage_movement" in d:
             prefs.movement.acquire_sem_after_stage_movement = d["acquire_sem_after_stage_movement"]
         if "acquire_fib_after_stage_movement" in d:
             prefs.movement.acquire_fib_after_stage_movement = d["acquire_fib_after_stage_movement"]
         if "experiment_directory" in d:
-            prefs.paths.default_experiment_directory = d["experiment_directory"]
+            prefs.experiment.default_experiment_directory = d["experiment_directory"]
         if "last_experiment_path" in d:
-            prefs.paths.last_experiment_path = d["last_experiment_path"]
+            prefs.experiment.last_experiment_path = d["last_experiment_path"]
         return prefs
 
 
@@ -333,28 +356,123 @@ def save_user_preferences(preferences) -> None:
         logging.warning(f"Failed to save user preferences to {USER_PREFERENCES_PATH}: {e}")
 
 
+@dataclass
+class RecentExperimentInfo:
+    """Display information for a recently used experiment."""
+    path: str  # path to the experiment.yaml file
+    name: str
+    created_at: float = 0.0
+    num_lamella: int = 0
+    exists: bool = True
+    available: bool = True  # False if the file is missing or could not be read
+
+
+def _peek_experiment_yaml(experiment_yaml_path: str) -> RecentExperimentInfo:
+    """Read minimal display info from an experiment.yaml without fully loading it.
+
+    Falls back to the parent directory name if the file is missing or unreadable.
+    A file that exists but cannot be parsed is kept (exists=True) but flagged
+    as unavailable so the UI can show it as such rather than silently pruning it.
+    """
+    fallback_name = os.path.basename(os.path.dirname(experiment_yaml_path)) or experiment_yaml_path
+    if not os.path.exists(experiment_yaml_path):
+        return RecentExperimentInfo(
+            path=experiment_yaml_path, name=fallback_name, exists=False, available=False
+        )
+
+    try:
+        with open(experiment_yaml_path, "r") as f:
+            ddict = yaml.safe_load(f) or {}
+        return RecentExperimentInfo(
+            path=experiment_yaml_path,
+            name=ddict.get("name") or fallback_name,
+            created_at=ddict.get("created_at") or 0.0,
+            num_lamella=len(ddict.get("positions") or []),
+            exists=True,
+            available=True,
+        )
+    except Exception as e:
+        logging.warning(f"Failed to read experiment info from {experiment_yaml_path}: {e}")
+        return RecentExperimentInfo(
+            path=experiment_yaml_path, name=fallback_name, exists=True, available=False
+        )
+
+
+def add_recent_experiment(prefs: UserPreferences, experiment_yaml_path: str) -> None:
+    """Update ``prefs.experiment.recent_experiments`` in place (does not save).
+
+    Moves the path to the front, de-duplicates, and truncates to
+    ``MAX_RECENT_EXPERIMENTS``. Use this when the caller already holds a prefs
+    object it intends to save, to avoid a redundant load/save cycle.
+
+    Args:
+        prefs: The preferences object to mutate.
+        experiment_yaml_path: Path to the experiment.yaml file.
+    """
+    if not experiment_yaml_path:
+        return
+
+    path = os.path.normpath(str(experiment_yaml_path))
+    recent = [p for p in prefs.experiment.recent_experiments if os.path.normpath(str(p)) != path]
+    recent.insert(0, path)
+    prefs.experiment.recent_experiments = recent[:MAX_RECENT_EXPERIMENTS]
+
+
+def record_recent_experiment(experiment_yaml_path: str) -> None:
+    """Record an experiment as recently used, moving it to the front of the list.
+
+    Args:
+        experiment_yaml_path: Path to the experiment.yaml file.
+    """
+    if not experiment_yaml_path:
+        return
+
+    prefs = load_user_preferences()
+    add_recent_experiment(prefs, experiment_yaml_path)
+    save_user_preferences(prefs)
+
+
+def get_recent_experiments(prune_missing: bool = True) -> List[RecentExperimentInfo]:
+    """Return display info for recent experiments, most-recent-first.
+
+    Args:
+        prune_missing: If True, drop paths that no longer exist on disk and
+            persist the pruned list back to preferences.
+    """
+    prefs = load_user_preferences()
+    infos = [_peek_experiment_yaml(str(p)) for p in prefs.experiment.recent_experiments]
+
+    if prune_missing:
+        kept = [info for info in infos if info.exists]
+        if len(kept) != len(infos):
+            prefs.experiment.recent_experiments = [info.path for info in kept]
+            save_user_preferences(prefs)
+        return kept
+
+    return infos
+
+
 def apply_feature_flags(prefs: UserPreferences) -> None:
     """Update module-level FEATURE_* constants from user preferences."""
     import fibsem.config as _self
-    global FEATURE_MINIMAP_PLOT_WIDGET_ENABLED
     global FEATURE_LAMELLA_POSITION_ON_LIVE_VIEW_ENABLED
-    global FEATURE_POSE_CONTROLS_ENABLED
-    global FEATURE_DISPLAY_GRID_CENTER_MARKER
     global FEATURE_VIEWER_MOVEMENT_EVENTS
+    global FEATURE_COINCIDENCE_MILLING_ENABLED
+    global FEATURE_SAMPLE_HOLDER_WIDGET_ENABLED
+    global FEATURE_SCHEDULED_TASKS_ENABLED
     f = prefs.features
-    FEATURE_MINIMAP_PLOT_WIDGET_ENABLED = f.minimap_plot_widget
     FEATURE_LAMELLA_POSITION_ON_LIVE_VIEW_ENABLED = f.lamella_position_on_live_view
-    FEATURE_POSE_CONTROLS_ENABLED = f.pose_controls
-    FEATURE_DISPLAY_GRID_CENTER_MARKER = f.display_grid_center_marker
     FEATURE_VIEWER_MOVEMENT_EVENTS = f.viewer_movement_events
+    FEATURE_COINCIDENCE_MILLING_ENABLED = f.coincidence_milling_enabled
+    FEATURE_SAMPLE_HOLDER_WIDGET_ENABLED = f.sample_holder_widget
+    FEATURE_SCHEDULED_TASKS_ENABLED = f.scheduled_tasks
 
     # Also update the autolamella config module which re-exports these
     try:
         import fibsem.applications.autolamella.config as al_cfg
-        al_cfg.FEATURE_MINIMAP_PLOT_WIDGET_ENABLED = f.minimap_plot_widget
         al_cfg.FEATURE_LAMELLA_POSITION_ON_LIVE_VIEW_ENABLED = f.lamella_position_on_live_view
-        al_cfg.FEATURE_POSE_CONTROLS_ENABLED = f.pose_controls
-        al_cfg.FEATURE_DISPLAY_GRID_CENTER_MARKER = f.display_grid_center_marker
+        al_cfg.FEATURE_COINCIDENCE_MILLING_ENABLED = f.coincidence_milling_enabled
+        al_cfg.FEATURE_SCHEDULED_TASKS_ENABLED = f.scheduled_tasks
     except ImportError:
         pass
 
@@ -370,8 +488,8 @@ AUTOLAMELLA_EXPERIMENT_NAME = "AutoLamella"
 os.makedirs(AUTOLAMELLA_LOG_PATH, exist_ok=True)
 
 ####### FEATURE FLAGS
-FEATURE_MINIMAP_PLOT_WIDGET_ENABLED = True
 FEATURE_LAMELLA_POSITION_ON_LIVE_VIEW_ENABLED = False
-FEATURE_POSE_CONTROLS_ENABLED = False
-FEATURE_DISPLAY_GRID_CENTER_MARKER = False
 FEATURE_VIEWER_MOVEMENT_EVENTS = False
+FEATURE_COINCIDENCE_MILLING_ENABLED = False
+FEATURE_SAMPLE_HOLDER_WIDGET_ENABLED = False
+FEATURE_SCHEDULED_TASKS_ENABLED = False

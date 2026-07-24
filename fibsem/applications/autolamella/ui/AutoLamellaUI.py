@@ -10,15 +10,15 @@ except Exception:
     pass
 import logging
 import os
-import subprocess
 import threading
 from copy import deepcopy
 from typing import List, Optional, TYPE_CHECKING
 import numpy as np
 import napari
 import fibsem
+from fibsem import conversions, utils
+from fibsem.constants import METRE_TO_MICRON, MICRON_TO_METRE
 from fibsem.ui import notification_service
-from fibsem import utils
 from fibsem.microscope import FibsemMicroscope
 from fibsem.structures import (
     BeamType,
@@ -39,28 +39,24 @@ from fibsem.ui import (
     MillingTaskViewerWidget,
     stylesheets,
 )
+from fibsem.ui.FMAcquisitionWidget import open_fm_acquisition_dialog
+from fibsem.ui.fm.widgets import FMImageViewerWidget
 from fibsem.ui import utils as fui
-from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
-    QAction,
-    QComboBox,
-    QDoubleSpinBox,
     QGridLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
-    QMenuBar,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSpacerItem,
     QTabWidget,
     QWidget,
 )
-from fibsem.ui.widgets.custom_widgets import LamellaNameListWidget, TitledPanel
+from fibsem.ui.widgets.custom_widgets import LamellaNameListWidget
+from fibsem.ui.widgets.selected_lamella_widget import SelectedLamellaWidget
 
 if (
     DETECTION_AVAILABLE
@@ -77,6 +73,7 @@ from fibsem.ui.widgets.autolamella_load_task_protocol_widget import (
     load_task_protocol_dialog,
 )
 from fibsem.ui.fm.widgets import MinimapPlotWidget
+from fibsem.ui.widgets.fluorescence_control_widget import FMControlWidget
 from fibsem.applications.autolamella import config as cfg
 from fibsem.applications.autolamella.structures import (
     AutoLamellaTaskProtocol,
@@ -92,10 +89,13 @@ from fibsem.applications.autolamella.workflows.tasks.hooks import (
     NotificationHook,
 )
 from fibsem.applications.autolamella.workflows.tasks.manager import TaskManager
+from fibsem.ui.widgets.workflow_summary_dialog import WorkflowSummaryDialog
 from psygnal import EmissionInfo
 from superqt import ensure_main_thread
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from fibsem.applications.autolamella.ui.AutoLamellaMainUI import (
         AutoLamellaSingleWindowUI,
     )
@@ -112,9 +112,6 @@ REPORTING_AVAILABLE: bool = False
 try:
     from fibsem.ui.widgets.autolamella_generate_report_widget import (
         generate_report_dialog,
-    )
-    from fibsem.ui.widgets.autolamella_experiment_task_summary_widget import (
-        create_experiment_task_summary_widget,
     )
     from fibsem.ui.widgets.autolamella_overview_image_widget import (
         create_overview_image_widget,
@@ -165,7 +162,7 @@ class AutoLamellaUI(QMainWindow):
     def __init__(
         self,
         viewer: napari.Viewer,
-        parent_ui: Optional["AutoLamellaSingleWindowUI"] = None,
+        parent_ui: "AutoLamellaSingleWindowUI",
     ) -> None:
         super().__init__()
 
@@ -174,9 +171,7 @@ class AutoLamellaUI(QMainWindow):
 
         self._protocol_lock = threading.RLock()
 
-        self.label_title.setText(f"AutoLamella v{fibsem.__version__}")
         self.viewer = viewer
-        self.viewer.title = f"AutoLamella v{fibsem.__version__}"
 
         # add placeholder layer
         self.viewer.add_image(np.zeros((10, 10)), name="Placeholder", visible=False)
@@ -189,6 +184,8 @@ class AutoLamellaUI(QMainWindow):
         self.image_widget: Optional[FibsemImageSettingsWidget] = None
         self.movement_widget: Optional[FibsemMovementWidget] = None
         self.spot_burn_widget: Optional[FibsemSpotBurnWidget] = None
+        self._fm_acquisition_dialog = None
+        self.fm_control_widget: Optional[FMControlWidget] = None
         self.milling_task_config_widget: Optional[MillingTaskViewerWidget] = None
         self.det_widget: Optional["FibsemEmbeddedDetectionWidget"] = None
 
@@ -214,6 +211,7 @@ class AutoLamellaUI(QMainWindow):
         self._workflow_stop_event: threading.Event = threading.Event()
         self._task_worker_thread: Optional[threading.Thread] = None
         self._task_manager: Optional[TaskManager] = None
+        self._last_run_summary: Optional["pd.DataFrame"] = None
 
         # setup connections
         self.setup_connections()
@@ -227,37 +225,20 @@ class AutoLamellaUI(QMainWindow):
         self.centralwidget = QWidget(self)
         self.gridLayout = QGridLayout(self.centralwidget)
 
-        # --- Title label (row 0, colspan 2) ---
-        self.label_title = QLabel("AutoLamella")
-        font_title = QFont()
-        font_title.setPointSize(16)
-        font_title.setBold(True)
-        self.label_title.setFont(font_title)
-        self.gridLayout.addWidget(self.label_title, 0, 0, 1, 2)
-
-        # --- Tab widget (row 1, colspan 2) ---
+        # --- Tab widget (row 0, colspan 2) ---
         self.tabWidget = QTabWidget(self.centralwidget)
 
         # Experiment tab
         self.tab = QWidget()
-        self.gridLayout_3 = QGridLayout(self.tab)
+        self.grid_layout_experiment = QGridLayout(self.tab)
 
         # Experiment name (row 0)
         self.label_experiment_name = QLabel("Experiment")
         self.lineEdit_experiment_name = QLineEdit()
-        self.gridLayout_3.addWidget(self.label_experiment_name, 0, 0)
-        self.gridLayout_3.addWidget(self.lineEdit_experiment_name, 0, 1)
 
         # Protocol name (row 3)
         self.label_protocol_name = QLabel("Protocol")
         self.lineEdit_protocol_name = QLineEdit()
-        self.gridLayout_3.addWidget(self.label_protocol_name, 3, 0)
-        self.gridLayout_3.addWidget(self.lineEdit_protocol_name, 3, 1)
-
-        # --- Selected Lamella panel (row 6, colspan 2) ---
-        selected_content = QWidget()
-        selected_layout = QGridLayout(selected_content)
-        selected_layout.setContentsMargins(0, 0, 0, 0)
 
         self.lamella_list = LamellaNameListWidget()
         self.lamella_list.enable_add_button(True)
@@ -266,120 +247,42 @@ class AutoLamellaUI(QMainWindow):
         self.lamella_list.enable_move_to_action(True)
         self.lamella_list.enable_update_action(True)
         self.lamella_list.enable_remove_button(True)
-        selected_layout.addWidget(self.lamella_list, 0, 0, 1, 2)
 
-        self.label_lamella_objective_position = QLabel("TextLabel")
-        self.doubleSpinBox_lamella_objective_position = QDoubleSpinBox()
-        selected_layout.addWidget(self.label_lamella_objective_position, 1, 0)
-        selected_layout.addWidget(self.doubleSpinBox_lamella_objective_position, 1, 1)
+        # --- Selected Lamella panel (row 6, colspan 2) ---
+        self.selected_lamella_widget = SelectedLamellaWidget()
 
-        self.label_lamella_pose = QLabel("Pose")
-        self.comboBox_lamella_pose = QComboBox()
-        selected_layout.addWidget(self.label_lamella_pose, 2, 0)
-        selected_layout.addWidget(self.comboBox_lamella_pose, 2, 1)
+        self.grid_layout_experiment.addWidget(self.label_experiment_name, 0, 0)
+        self.grid_layout_experiment.addWidget(self.lineEdit_experiment_name, 0, 1)
+        self.grid_layout_experiment.addWidget(self.label_protocol_name, 1, 0)
+        self.grid_layout_experiment.addWidget(self.lineEdit_protocol_name, 1, 1)
+        self.grid_layout_experiment.addWidget(self.lamella_list, 2, 0, 1, 2)
+        self.grid_layout_experiment.addWidget(self.selected_lamella_widget, 3, 0, 1, 2)
 
-        self.label_lamella_pose_position = QLabel("TextLabel")
-        selected_layout.addWidget(self.label_lamella_pose_position, 3, 0, 1, 2)
-
-        self.pushButton_lamella_set_pose = QPushButton("Set Current Pose")
-        self.pushButton_lamella_move_to_pose = QPushButton("Move to Pose")
-        selected_layout.addWidget(self.pushButton_lamella_set_pose, 4, 0)
-        selected_layout.addWidget(self.pushButton_lamella_move_to_pose, 4, 1)
-
-        self.groupBox_selected_lamella = TitledPanel(
-            "Selected Lamella", content=selected_content, collapsible=False
+        # Vertical spacer (row 7)
+        self.grid_layout_experiment.addItem(
+            QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding), 4, 0, 1, 2
         )
-        self.gridLayout_3.addWidget(self.groupBox_selected_lamella, 6, 0, 1, 2)
-
-        # --- Lamella info panel (row 7, colspan 2) ---
-        lamella_content = QWidget()
-        lamella_layout = QGridLayout(lamella_content)
-        lamella_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.scrollArea_lamella_info = QScrollArea()
-        self.scrollArea_lamella_info.setSizePolicy(
-            QSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Expanding)
-        )
-        self.scrollArea_lamella_info.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # type: ignore
-        self.scrollArea_lamella_info.setWidgetResizable(True)
-        self.scrollAreaLamellaInfoWidget = QWidget()
-        self.gridLayout_8 = QGridLayout(self.scrollAreaLamellaInfoWidget)
-        self.scrollArea_lamella_info.setWidget(self.scrollAreaLamellaInfoWidget)
-        lamella_layout.addWidget(self.scrollArea_lamella_info, 0, 0)
-
-        self.groupBox_lamella = TitledPanel(
-            "Lamella", content=lamella_content, collapsible=False
-        )
-        self.groupBox_lamella.setSizePolicy(
-            QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        )
-        self.gridLayout_3.addWidget(self.groupBox_lamella, 7, 0, 1, 2)
-
-        # Vertical spacer (row 9)
-        self.gridLayout_3.addItem(
-            QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding), 9, 0, 1, 2
-        )
-
-        # Stop button (row 33)
-        self.pushButton_stop_workflow = QPushButton("Stop Workflow")
-        self.gridLayout_3.addWidget(self.pushButton_stop_workflow, 33, 0, 1, 2)
 
         # Add Experiment tab to tabWidget
         self.tabWidget.addTab(self.tab, "Experiment")
-        self.gridLayout.addWidget(self.tabWidget, 1, 0, 1, 2)
 
         # --- Workflow info (row 2) ---
         self.label_workflow_information = QLabel("Workflow Information")
-        self.gridLayout.addWidget(self.label_workflow_information, 2, 0, 1, 2)
 
         # --- Instructions (row 3) ---
         self.label_instructions = QLabel("Instructions")
-        self.gridLayout.addWidget(self.label_instructions, 3, 0, 1, 2)
 
         # --- Yes / No buttons (row 4) ---
         self.pushButton_yes = QPushButton("Yes")
         self.pushButton_no = QPushButton("No")
+
+        self.gridLayout.addWidget(self.tabWidget, 1, 0, 1, 2)
+        self.gridLayout.addWidget(self.label_workflow_information, 2, 0, 1, 2)
+        self.gridLayout.addWidget(self.label_instructions, 3, 0, 1, 2)
         self.gridLayout.addWidget(self.pushButton_yes, 4, 0)
         self.gridLayout.addWidget(self.pushButton_no, 4, 1)
 
         self.setCentralWidget(self.centralwidget)
-
-        # --- Menu bar ---
-        self.menubar = QMenuBar(self)
-        self.menuAutoLamella = QMenu("File", self.menubar)
-        self.menuTools = QMenu("Tools", self.menubar)
-        self.menuHelp = QMenu("Help", self.menubar)
-        self.menuDevelopment = QMenu("Development", self.menubar)
-        self.setMenuBar(self.menubar)
-
-        # --- Actions ---
-        self.actionNew_Experiment = QAction("Create Experiment", self)
-        self.actionLoad_Experiment = QAction("Load Experiment", self)
-        self.actionCryo_Deposition = QAction("Cryo Deposition", self)
-        self.actionLoad_Protocol = QAction("Load Protocol", self)
-        self.actionOpen_Minimap = QAction("Open Overview Acquisition", self)
-        self.actionSave_Protocol = QAction("Export Protocol", self)
-        self.actionInformation = QAction("Information", self)
-        self.actionAdd_Lamella_from_Odemis = QAction("Add Lamella from Odemis", self)
-
-        # --- Menu population ---
-        self.menuAutoLamella.addAction(self.actionNew_Experiment)
-        self.menuAutoLamella.addAction(self.actionLoad_Experiment)
-        self.menuAutoLamella.addSeparator()
-        self.menuAutoLamella.addAction(self.actionLoad_Protocol)
-        self.menuAutoLamella.addAction(self.actionSave_Protocol)
-
-        self.menuTools.addAction(self.actionCryo_Deposition)
-        self.menuTools.addSeparator()
-
-        self.menuHelp.addAction(self.actionInformation)
-        self.menuDevelopment.addAction(self.actionAdd_Lamella_from_Odemis)
-
-        self.menubar.addAction(self.menuAutoLamella.menuAction())
-        self.menubar.addAction(self.menuTools.menuAction())
-        self.menubar.addAction(self.menuHelp.menuAction())
-        self.menubar.addAction(self.menuDevelopment.menuAction())
-
         self.tabWidget.setCurrentIndex(0)
 
     @property
@@ -411,79 +314,7 @@ class AutoLamellaUI(QMainWindow):
         self.system_widget.connected_signal.connect(self.connect_to_microscope)
         self.system_widget.disconnected_signal.connect(self.disconnect_from_microscope)
 
-        # file menu
-        self.actionNew_Experiment.triggered.connect(self.create_experiment)
-        self.actionLoad_Experiment.triggered.connect(self.load_experiment)
-        self.actionLoad_Protocol.triggered.connect(self.load_protocol)
-        self.actionSave_Protocol.triggered.connect(self.export_protocol_ui)
-        # tool menu
-        self.actionCryo_Deposition.triggered.connect(self.cryo_deposition)
-        self.actionCryo_Deposition.setEnabled(False)  # TMP: disable until tested
-        self.actionCryo_Deposition.setToolTip(
-            "Cryo Deposition is currently disabled via the UI."
-        )
-        self.actionOpen_Minimap = QAction(  # type: ignore
-            text="Open Overview Acquisition",
-            parent=self,
-            triggered=self.open_minimap_widget,
-        )
-        self.actionGenerate_Report = QAction(  # type: ignore
-            text="Generate Report", parent=self, triggered=self.action_generate_report
-        )
-        self.actionGenerate_Overview_Plot = QAction(  # type: ignore
-            text="Generate Overview Plot",
-            parent=self,
-            triggered=self.action_generate_overview_plot,
-        )
-
-        self.action_open_experiment_directory = QAction(  # type: ignore
-            "Open Experiment Directory",
-            parent=self,
-            triggered=self._open_experiment_directory,
-        )
-
-        # add to menu
-        if os.name == "posix":
-            self.menuBar().setNativeMenuBar(False)  # required for macOS
-        self.menuAutoLamella.addSeparator()
-        self.menuAutoLamella.addAction(self.action_open_experiment_directory)
-
-        # reporting
-        self.action_open_experiment_workflow_summary = QAction(  # type: ignore
-            text="Open Workflow Summary",
-            parent=self,
-            triggered=self._open_experiment_workflow_summary,
-        )
-
-        # tools menu
-        self.menuTools.setToolTipsVisible(True)
-        self.menuTools.addAction(self.actionOpen_Minimap)
-        self.menuTools.addAction(self.action_open_experiment_workflow_summary)
-
-        # submenu for reporting
-        self.menuTools.addSeparator()
-        self.menuReporting = self.menuTools.addMenu("Reporting")
-        self.menuReporting.addAction(self.actionGenerate_Report)
-        self.menuReporting.addAction(self.actionGenerate_Overview_Plot)
-        self.menuReporting.setVisible(REPORTING_AVAILABLE)
-        self.action_open_experiment_workflow_summary.setVisible(REPORTING_AVAILABLE)
-
-        # development
-        self.menuDevelopment.setVisible(False)
-        self.actionAdd_Lamella_from_Odemis.setVisible(
-            False
-        )  # TMP: disable until tested
-        self.actionAdd_Lamella_from_Odemis.triggered.connect(
-            self._add_lamella_from_odemis
-        )
-        # help menu
-        self.actionInformation.triggered.connect(
-            lambda: fui.open_information_dialog(self.microscope, self)
-        )
-
         # workflow interaction
-        self.pushButton_stop_workflow.setVisible(False)
-        self.pushButton_stop_workflow.clicked.connect(self._stop_workflow_thread)
         self.pushButton_yes.clicked.connect(self.push_interaction_button)
         self.pushButton_no.clicked.connect(self.push_interaction_button)
 
@@ -492,18 +323,11 @@ class AutoLamellaUI(QMainWindow):
         self.workflow_update_signal.connect(self.handle_workflow_update)
         self._workflow_finished_signal.connect(self._workflow_finished)  # type: ignore
 
-        self.pushButton_stop_workflow.setStyleSheet(
-            stylesheets.STOP_WORKFLOW_BUTTON_STYLESHEET
-        )
-
         # labels and placeholders
         self.lineEdit_experiment_name.setPlaceholderText("No Experiment Loaded")
         self.lineEdit_protocol_name.setPlaceholderText("No Protocol Loaded")
         self.lineEdit_protocol_name.setReadOnly(True)
         self.lineEdit_experiment_name.setReadOnly(True)
-
-        self.scrollArea_lamella_info.setVisible(False)
-        self.groupBox_lamella.setVisible(False)
 
         # workflow info
         self.set_current_workflow_message(msg=None, show=False)
@@ -513,37 +337,24 @@ class AutoLamellaUI(QMainWindow):
         # refresh ui
         self.update_ui()
 
-        self.label_lamella_objective_position.setText("Objective Position")
-        self.doubleSpinBox_lamella_objective_position.setSuffix(" mm")
-        self.doubleSpinBox_lamella_objective_position.setDecimals(3)
-        self.doubleSpinBox_lamella_objective_position.setSingleStep(0.001)
-        self.doubleSpinBox_lamella_objective_position.setRange(-20.0, 20.0)
-        self.doubleSpinBox_lamella_objective_position.valueChanged.connect(
+        self.selected_lamella_widget.objective_position_changed.connect(
             self.update_lamella_objective_position
         )
-        self.doubleSpinBox_lamella_objective_position.setKeyboardTracking(False)
-
-        self.comboBox_lamella_pose.currentIndexChanged.connect(
-            self._on_lamella_pose_combobox_changed
+        self.selected_lamella_widget.use_current_objective_requested.connect(
+            self._use_current_objective_position
         )
-        self.pushButton_lamella_set_pose.clicked.connect(
+        self.selected_lamella_widget.apply_objective_to_all_requested.connect(
+            self._apply_objective_position_to_all
+        )
+        self.selected_lamella_widget.move_objective_requested.connect(
+            self._move_objective_to_lamella_position
+        )
+        self.selected_lamella_widget.pose_update_requested.connect(
             self._set_current_position_as_pose
         )
-        self.pushButton_lamella_set_pose.setToolTip(
-            "Set the current stage position as the lamella pose position."
+        self.selected_lamella_widget.pose_move_to_requested.connect(
+            self._move_to_lamella_pose
         )
-
-        self.pushButton_lamella_move_to_pose.clicked.connect(self._move_to_lamella_pose)
-        self.pushButton_lamella_move_to_pose.setToolTip(
-            "Move the stage to the lamella pose position."
-        )
-        self.pushButton_lamella_set_pose.setStyleSheet(
-            stylesheets.SECONDARY_BUTTON_STYLESHEET
-        )
-        self.pushButton_lamella_move_to_pose.setStyleSheet(
-            stylesheets.SECONDARY_BUTTON_STYLESHEET
-        )
-        self.label_lamella_pose_position.setWordWrap(True)
 
     ##########
 
@@ -557,7 +368,6 @@ class AutoLamellaUI(QMainWindow):
             # TODO: update the ui with new state
             # logging.info(f"Unhandled event: {evt.signal.name}: {evt.path}, {evt.args}")
             return
-
 
         self.update_lamella_combobox()
         self.update_ui()
@@ -764,7 +574,9 @@ class AutoLamellaUI(QMainWindow):
     def create_experiment(self) -> None:
         """Create a new experiment using the experiment creation dialog."""
         if self.microscope is None:
-            notification_service.show_toast("Please connect to microscope first.", "warning")
+            notification_service.show_toast(
+                "Please connect to microscope first.", "warning"
+            )
             return
 
         # Open the experiment creation dialog
@@ -788,7 +600,9 @@ class AutoLamellaUI(QMainWindow):
     def load_experiment(self) -> None:
         """Load an existing experiment using the experiment loading dialog."""
         if self.microscope is None:
-            notification_service.show_toast("Please connect to microscope first.", "warning")
+            notification_service.show_toast(
+                "Please connect to microscope first.", "warning"
+            )
             return
 
         # Open the experiment loading dialog
@@ -856,6 +670,16 @@ class AutoLamellaUI(QMainWindow):
             )
             self.tabWidget.addTab(self.milling_task_config_widget, "Milling")
 
+            if self.microscope.fm is not None:
+                self.fm_control_widget = FMControlWidget(
+                    microscope=self.microscope, viewer=self.viewer, parent=self
+                )
+                if self.settings is not None and self.settings.fm is not None:
+                    self.fm_control_widget._apply_fluorescence_configuration(
+                        self.settings.fm
+                    )
+                self.tabWidget.addTab(self.fm_control_widget, "Fluorescence")
+
             # add the detection widget if ml dependencies are available
             if DETECTION_AVAILABLE:
                 self.det_widget = FibsemEmbeddedDetectionWidget(parent=self)
@@ -878,7 +702,7 @@ class AutoLamellaUI(QMainWindow):
                     logging.info(
                         "OdemisThermoMicroscope detected, enabling Odemis specific features."
                     )
-                    self.actionAdd_Lamella_from_Odemis.setVisible(True)
+
             except Exception as e:
                 logging.debug(f"OdemisThermoMicroscope not available: {e}")
 
@@ -890,11 +714,16 @@ class AutoLamellaUI(QMainWindow):
                 return
 
             # remove tabs
+            if self.fm_control_widget is not None:
+                self.tabWidget.removeTab(self.tabWidget.indexOf(self.fm_control_widget))
+                self.fm_control_widget.deleteLater()
+                self.fm_control_widget = None
             if self.det_widget is not None:
                 self.tabWidget.removeTab(self.tabWidget.indexOf(self.det_widget))
                 self.det_widget.deleteLater()
                 self.det_widget = None
             if self.spot_burn_widget is not None:
+                self.spot_burn_widget.disconnect_signals()
                 self.tabWidget.removeTab(self.tabWidget.indexOf(self.spot_burn_widget))
                 self.spot_burn_widget.deleteLater()
                 self.spot_burn_widget = None
@@ -917,6 +746,38 @@ class AutoLamellaUI(QMainWindow):
                 self.image_widget.deleteLater()
                 self.image_widget = None
 
+    def import_fm_configuration(self) -> None:
+        """Load a fluorescence microscope configuration via the control widget."""
+        if self.fm_control_widget is None:
+            msg = "Fluorescence control not available. Connect to an FM-enabled microscope first."
+            logging.warning(msg)
+            notification_service.show_toast(msg, "warning")
+            return
+
+        try:
+            self.fm_control_widget.import_fm_configuration()
+        except Exception:
+            logging.exception("Failed to load FM configuration from AutoLamella UI.")
+            notification_service.show_toast(
+                "Failed to load FM configuration. Check logs for details.", "error"
+            )
+
+    def export_fm_configuration(self) -> None:
+        """Save the current fluorescence microscope configuration via the control widget."""
+        if self.fm_control_widget is None:
+            msg = "Fluorescence control not available. Connect to an FM-enabled microscope first."
+            logging.warning(msg)
+            notification_service.show_toast(msg, "warning")
+            return
+
+        try:
+            self.fm_control_widget.export_fm_configuration()
+        except Exception:
+            logging.exception("Failed to save FM configuration from AutoLamella UI.")
+            notification_service.show_toast(
+                "Failed to save FM configuration. Check logs for details.", "error"
+            )
+
     #### REPORT GENERATION
     def action_generate_report(self) -> None:
         """Generate a pdf report of the experiment."""
@@ -932,7 +793,9 @@ class AutoLamellaUI(QMainWindow):
             return
 
         if not REPORTING_AVAILABLE:
-            notification_service.show_toast("Reporting tools are not available.", "warning")
+            notification_service.show_toast(
+                "Reporting tools are not available.", "warning"
+            )
             return
 
         dialog = create_overview_image_widget(experiment=self.experiment, parent=self)
@@ -940,23 +803,16 @@ class AutoLamellaUI(QMainWindow):
 
         return
 
-    def _open_experiment_workflow_summary(self):
-        """Open the experiment task workflow summary dialog."""
-
-        if self.experiment is None:
-            notification_service.show_toast("Please load an experiment first.", "warning")
-            return
-
-        if not REPORTING_AVAILABLE:
-            notification_service.show_toast("Reporting tools are not available.", "warning")
-            return
-
-        dialog = create_experiment_task_summary_widget(
-            experiment=self.experiment, parent=self
-        )
-        dialog.exec_()
-
     #### PROTOCOL EDITOR
+
+    def open_information_dialog(self) -> None:
+        if self.microscope is None:
+            notification_service.show_toast(
+                "Please connect to a microscope first... [No Microscope Connected]",
+                "warning",
+            )
+            return
+        fui.open_information_dialog(self.microscope, self)
 
     def _open_experiment_directory(self) -> None:
         """Open the experiment directory in the system file explorer."""
@@ -973,25 +829,90 @@ class AutoLamellaUI(QMainWindow):
             )
             return
 
-        try:
-            if sys.platform.startswith("darwin"):
-                subprocess.Popen(["open", experiment_path])
-            elif os.name == "nt":
-                os.startfile(experiment_path)  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", experiment_path])
-        except Exception:
-            logging.exception("Failed to open experiment directory.")
-            notification_service.show_toast("Failed to open experiment directory.", "error")
+        if not fui.open_path_in_file_explorer(experiment_path):
+            notification_service.show_toast(
+                "Failed to open experiment directory.", "error"
+            )
+
+    #### FLUORESCENCE MINIMAP
+
+    def open_fm_minimap_widget(self):
+        if self.microscope is None:
+            notification_service.show_toast(
+                "Please connect to a microscope first... [No Microscope Connected]",
+                "warning",
+            )
+            return
+
+        if self.microscope.fm is None:
+            notification_service.show_toast(
+                "Connected microscope does not have fluorescence capabilities.",
+                "warning",
+            )
+            return
+
+        if self.experiment is None:
+            notification_service.show_toast(
+                "Please load an experiment first... [No Experiment Loaded]", "warning"
+            )
+            return
+
+        self._fm_acquisition_dialog = open_fm_acquisition_dialog(
+            microscope=self.microscope,
+            experiment=self.experiment,
+            parent=self,
+        )
+
+    def _open_fm_image_viewer(self):
+        """Open a new napari viewer with the FM Image Viewer widget."""
+        if self.experiment is None:
+            notification_service.show_toast(
+                "Please load an experiment first... [No Experiment Loaded]", "warning"
+            )
+            return
+
+        viewer = napari.Viewer(title="FM Image Viewer")
+        experiment_path = str(self.experiment.path) if self.experiment.path else None
+        fm_image_viewer = FMImageViewerWidget(
+            viewer=viewer, start_directory=experiment_path, parent=self
+        )
+        viewer.window.add_dock_widget(
+            fm_image_viewer, name="FM Image Viewer", area="right"
+        )
+        viewer.window.activate()
+
+    def _open_coincidence_milling_viewer(self):
+        """Open FluorescenceCoincidenceViewerWidget as a standalone dialog."""
+        if self.microscope is None or self.experiment is None:
+            notification_service.show_toast(
+                "Please connect a microscope and load an experiment first.", "warning"
+            )
+            return
+        if self.microscope.fm is None:
+            notification_service.show_toast(
+                "Coincidence milling requires a fluorescence microscope.", "warning"
+            )
+            return
+        from fibsem.ui.widgets.fluorescence_coincidence_viewer_widget import (
+            open_coincidence_viewer_window,
+        )
+
+        # seed the viewer's FM tab from the live main-UI FM configuration
+        fm_config = None
+        if self.fm_control_widget is not None:
+            try:
+                fm_config = self.fm_control_widget._build_fluorescence_configuration()
+            except Exception as e:
+                logging.warning(f"Could not read current FM configuration: {e}")
+
+        self._coincidence_viewer_window = open_coincidence_viewer_window(
+            microscope=self.microscope,
+            experiment=self.experiment,
+            parent=self,
+            fm_config=fm_config,
+        )
 
     #### MINIMAP
-
-    def open_minimap_widget(self):
-        notification_service.show_toast(
-            "Overview acquisition is under development and will be available in a future release.",
-            "info",
-        )
-        return
 
     def _update_minimap_data(
         self,
@@ -1001,9 +922,6 @@ class AutoLamellaUI(QMainWindow):
         if self.microscope is None:
             return
         if self.experiment is None:
-            return
-
-        if not cfg.FEATURE_MINIMAP_PLOT_WIDGET_ENABLED:
             return
 
         if self.minimap_plot_widget is None:
@@ -1032,12 +950,9 @@ class AutoLamellaUI(QMainWindow):
             self.minimap_plot_widget.lamella_positions = (
                 self.experiment.get_milling_positions()
             )
-            if (
-                self.minimap_plot_widget.grid_positions is None
-                and cfg.FEATURE_DISPLAY_GRID_CENTER_MARKER
-            ):
+            if self.minimap_plot_widget.grid_positions is None:
                 self.minimap_plot_widget.grid_positions = [
-                    g.position for g in self.microscope._stage.holder.grids.values()
+                    s.position for s in self.microscope._stage.holder.slots.values()
                 ]
             self.minimap_plot_widget.fov_width = fov
             if stage_position is not None:
@@ -1055,7 +970,6 @@ class AutoLamellaUI(QMainWindow):
         self, selected_tasks: List[str], selected_lamella: List[str]
     ) -> None:
         """Start the workflow thread with the selected tasks and lamella, and update the UI accordingly."""
-        self.pushButton_stop_workflow.setVisible(False)
 
         # clear milling task config
         self.milling_task_config_widget.clear()  # type: ignore
@@ -1091,6 +1005,10 @@ class AutoLamellaUI(QMainWindow):
                 parent_ui=self,
                 hook_manager=self.setup_hooks(),
             )
+            # Honor a stop requested before the manager existed (e.g. clicked
+            # during beam-on, while _task_manager was still None).
+            if self._workflow_stop_event.is_set():
+                self._task_manager.stop()
             self._task_manager.run(
                 task_names=task_names, required_lamella=lamella_names
             )
@@ -1099,6 +1017,13 @@ class AutoLamellaUI(QMainWindow):
 
         finally:
             cancelled = self._task_manager is not None and self._task_manager.is_stopped
+            # capture the per-run summary before the manager is torn down
+            if self._task_manager is not None:
+                try:
+                    self._last_run_summary = self._task_manager.build_run_summary_dataframe()
+                except Exception as e:
+                    logging.warning(f"Failed to build workflow run summary: {e}")
+                    self._last_run_summary = None
             self._task_manager = None
             self._task_worker_thread = None
             self._workflow_finished_signal.emit(cancelled)  # type: ignore
@@ -1118,6 +1043,7 @@ class AutoLamellaUI(QMainWindow):
                     HookEvent.TASK_STARTED,
                     HookEvent.TASK_COMPLETED,
                     HookEvent.TASK_FAILED,
+                    HookEvent.TASK_CANCELLED,
                 ],
             )
         )
@@ -1137,6 +1063,14 @@ class AutoLamellaUI(QMainWindow):
                 message_template="Task {task_name} FAILED: {error}",
             )
         )
+        manager.register(
+            NotificationHook(
+                name="cancellation_toast",
+                events=[HookEvent.TASK_CANCELLED],
+                notification_type="warning",
+                message_template="Task {task_name} cancelled for {lamella_name}",
+            )
+        )
         manager.wire(self)
         return manager
 
@@ -1146,8 +1080,8 @@ class AutoLamellaUI(QMainWindow):
         """Update the ui based on the current state of the application."""
 
         if self.is_workflow_running:
-            self.groupBox_selected_lamella.setEnabled(False)
-            self.pushButton_stop_workflow.setVisible(False)
+            self.selected_lamella_widget.setEnabled(False)
+
             return
 
         # state flags
@@ -1159,44 +1093,13 @@ class AutoLamellaUI(QMainWindow):
         has_lamella = bool(self.experiment.positions) if is_experiment_loaded else False
         is_experiment_ready = is_experiment_loaded and is_protocol_loaded
 
-        self.action_open_experiment_directory.setEnabled(is_experiment_loaded)
-
         # force order: connect -> experiment -> protocol
         self.tabWidget.setTabVisible(
             self.tabWidget.indexOf(self.tab), is_microscope_connected
         )
-        self.actionNew_Experiment.setEnabled(is_microscope_connected)
-        self.actionLoad_Experiment.setEnabled(is_microscope_connected)
-        self.actionInformation.setEnabled(is_microscope_connected)
         if self.det_widget is not None:
             idx = self.tabWidget.indexOf(self.det_widget)
             self.tabWidget.setTabVisible(idx, False)  # hide detection tab for now
-
-        # experiment loaded
-        # file menu
-        self.actionLoad_Protocol.setEnabled(is_experiment_loaded)
-        self.actionSave_Protocol.setEnabled(is_protocol_loaded)
-        # tool menu
-        self.actionCryo_Deposition.setVisible(True)
-        self.actionOpen_Minimap.setEnabled(is_experiment_ready)
-        self.menuReporting.setEnabled(is_experiment_ready and REPORTING_AVAILABLE)
-        self.action_open_experiment_workflow_summary.setEnabled(
-            is_experiment_ready and REPORTING_AVAILABLE
-        )
-
-        # tooltips for disabled tools menu items
-        tools_disabled_tooltip = ""
-        if not is_experiment_ready:
-            tools_disabled_tooltip = "Create or load an experiment first. \nFile -> Create Experiment or Load Experiment"
-        self.actionOpen_Minimap.setToolTip(tools_disabled_tooltip)
-        self.action_open_experiment_workflow_summary.setToolTip(tools_disabled_tooltip)
-        # help menu
-        self.actionGenerate_Report.setEnabled(
-            is_experiment_ready and REPORTING_AVAILABLE
-        )
-        self.actionGenerate_Overview_Plot.setEnabled(
-            is_experiment_ready and REPORTING_AVAILABLE
-        )
 
         # labels
         self.lineEdit_experiment_name.setToolTip("No Experiment Loaded")
@@ -1212,19 +1115,14 @@ class AutoLamellaUI(QMainWindow):
 
         # buttons
         self.lamella_list.setEnabled(is_experiment_ready)
-        self.groupBox_selected_lamella.setEnabled(is_experiment_ready)
+        self.selected_lamella_widget.setEnabled(is_experiment_ready)
 
-        enable_pose_controls = bool(has_lamella) and cfg.FEATURE_POSE_CONTROLS_ENABLED
-        self.label_lamella_pose.setVisible(enable_pose_controls)
-        self.comboBox_lamella_pose.setVisible(enable_pose_controls)
-        self.label_lamella_pose_position.setVisible(enable_pose_controls)
-        self.pushButton_lamella_move_to_pose.setVisible(enable_pose_controls)
-        self.pushButton_lamella_set_pose.setVisible(enable_pose_controls)
-        self.label_lamella_objective_position.setVisible(False)
-        self.doubleSpinBox_lamella_objective_position.setVisible(False)
+        # clear the panel when no lamella is selected; populated by update_lamella_ui otherwise
+        if not has_lamella:
+            self.selected_lamella_widget.set_lamella(None)
 
         # disable lamella controls while workflow is running
-        self.groupBox_selected_lamella.setEnabled(not self.is_workflow_running)
+        self.selected_lamella_widget.setEnabled(not self.is_workflow_running)
 
         # Current Lamella Status
         if has_lamella and self.experiment is not None:
@@ -1294,46 +1192,8 @@ class AutoLamellaUI(QMainWindow):
         lamella: Lamella = self.experiment.positions[idx]
         logging.info(f"Updating Lamella UI for {lamella.status_info}")
 
-        # set objective position (show as mm)
-        obj_controls_enabled = lamella.objective_position is not None
-        if obj_controls_enabled:
-            self.doubleSpinBox_lamella_objective_position.blockSignals(True)
-            self.doubleSpinBox_lamella_objective_position.setValue(
-                lamella.objective_position * 1e3
-            )
-            self.doubleSpinBox_lamella_objective_position.blockSignals(False)
-        self.label_lamella_objective_position.setVisible(obj_controls_enabled)
-        self.doubleSpinBox_lamella_objective_position.setVisible(obj_controls_enabled)
-
-        # set lamella pose display
-        if lamella.poses:
-            self.comboBox_lamella_pose.blockSignals(True)
-            current_text = self.comboBox_lamella_pose.currentText()
-            self.comboBox_lamella_pose.clear()
-            self.comboBox_lamella_pose.addItems(list(lamella.poses.keys()))
-
-            # restore
-            if current_text in lamella.poses:
-                self.comboBox_lamella_pose.setCurrentText(current_text)
-            else:
-                self.comboBox_lamella_pose.setCurrentIndex(0)
-
-            current_pose = self.comboBox_lamella_pose.currentText()
-            pose = lamella.poses.get(current_pose, None)
-
-            txt = "Pose: Unknown"
-            if pose is not None and pose.stage_position is not None:
-                txt = f"Pose: {pose.stage_position.pretty}"
-            self.label_lamella_pose_position.setText(txt)
-            self.comboBox_lamella_pose.blockSignals(False)
-
-        # hide pose controls if no poses
-        enable_pose_controls = bool(lamella.poses) and cfg.FEATURE_POSE_CONTROLS_ENABLED
-        self.label_lamella_pose.setVisible(enable_pose_controls)
-        self.comboBox_lamella_pose.setVisible(enable_pose_controls)
-        self.label_lamella_pose_position.setVisible(enable_pose_controls)
-        self.pushButton_lamella_move_to_pose.setVisible(enable_pose_controls)
-        self.pushButton_lamella_set_pose.setVisible(enable_pose_controls)
+        # refresh objective position + pose display for the selected lamella
+        self.selected_lamella_widget.set_lamella(lamella)
 
         self._update_minimap_data(selected_name=lamella.name)
         self._update_lamella_display(selected_name=lamella.name)
@@ -1436,12 +1296,22 @@ class AutoLamellaUI(QMainWindow):
         )
         lamella = self.experiment.positions[-1]
 
+        # derive the milling angle from the milling-pose stage tilt
+        lamella.update_milling_angle(self.microscope)
+
         # if the objective position is not provided, use the 'focus' position from the microscope
         if self.microscope.fm is not None:
-            lamella.fluorescence_pose = deepcopy(microscope_state)
+            # convert the fluorescence pose to the configured orientation
+            fluorescence_stage_position = self.microscope.get_target_position(
+                stage_position=deepcopy(microscope_state.stage_position),
+                target_orientation=self.microscope.fm.default_orientation,
+            )
+            fluorescence_pose = deepcopy(microscope_state)
+            fluorescence_pose.stage_position = fluorescence_stage_position
             if objective_position is None:
                 objective_position = self.microscope.fm.objective.focus_position
-            lamella.objective_position = objective_position
+            fluorescence_pose.objective_position = objective_position
+            lamella.fluorescence_pose = fluorescence_pose
 
         self.experiment.save()
         self.update_lamella_combobox(latest=True)
@@ -1547,31 +1417,16 @@ class AutoLamellaUI(QMainWindow):
 
         lamella.milling_pose = deepcopy(self.microscope.get_microscope_state())
 
+        # keep the milling angle consistent with the updated milling pose
+        lamella.update_milling_angle(self.microscope)
+
         self.update_lamella_combobox()
         self.update_ui()
         self.experiment.save()
         self.experiment.positions.events.changed.emit()
 
-    def _on_lamella_pose_combobox_changed(self):
-        """Update the pose position label when the pose combobox is changed."""
-
-        lamella: Lamella
-        if self.experiment is None or self.experiment.positions == []:
-            return
-        idx = self.lamella_list.selected_index
-        if idx == -1:
-            return
-        lamella = self.experiment.positions[idx]
-        pose_name = self.comboBox_lamella_pose.currentText()
-        if pose_name not in lamella.poses:
-            return
-        pose = lamella.poses[pose_name]
-        if pose.stage_position is None:
-            return
-        self.label_lamella_pose_position.setText(f"Pose: {pose.stage_position.pretty}")
-
-    def _set_current_position_as_pose(self):
-        """Set the current stage position as the selected pose for the current lamella."""
+    def _set_current_position_as_pose(self, pose_name: str):
+        """Set the current stage position as the given pose for the current lamella."""
 
         if self.microscope is None:
             notification_service.show_toast("No microscope connected.", "warning")
@@ -1584,14 +1439,15 @@ class AutoLamellaUI(QMainWindow):
             notification_service.show_toast("No lamella selected.", "warning")
             return
         lamella: Lamella = self.experiment.positions[idx]
-        pose_name = self.comboBox_lamella_pose.currentText()
         if pose_name == "":
             notification_service.show_toast("No pose selected.", "warning")
             return
         state = self.microscope.get_microscope_state()
 
         if state is None or state.stage_position is None:
-            notification_service.show_toast("Failed to get microscope state.", "warning")
+            notification_service.show_toast(
+                "Failed to get microscope state.", "warning"
+            )
             return
 
         # confirmation dialog
@@ -1604,15 +1460,27 @@ class AutoLamellaUI(QMainWindow):
         if ret != QMessageBox.Yes:
             return
 
+        # preserve the configured objective (focus) position of the existing pose:
+        # get_microscope_state() does not capture the objective position, so replacing
+        # the pose outright would wipe the fluorescence pose's focus setting.
+        existing_pose = lamella.poses.get(pose_name)
+        if existing_pose is not None and existing_pose.objective_position is not None:
+            state.objective_position = existing_pose.objective_position
+
         lamella.poses[pose_name] = state
+
+        # if the milling pose changed, keep the milling angle consistent with it
+        if pose_name == "MILLING":
+            lamella.update_milling_angle(self.microscope)
+
         self.experiment.save()
-        self.label_lamella_pose_position.setText(f"{state.stage_position.pretty}")
+        self.selected_lamella_widget.refresh_pose(pose_name, state.stage_position.pretty)
         notification_service.show_toast(
             f"Set current position as pose '{pose_name}' for {lamella.name}.", "info"
         )
 
-    def _move_to_lamella_pose(self):
-        """Move the stage to the selected pose for the current lamella."""
+    def _move_to_lamella_pose(self, pose_name: str):
+        """Move the stage to the given pose for the current lamella."""
 
         if self.microscope is None:
             notification_service.show_toast("No microscope connected.", "warning")
@@ -1628,16 +1496,19 @@ class AutoLamellaUI(QMainWindow):
             notification_service.show_toast("No lamella selected.", "warning")
             return
         lamella: Lamella = self.experiment.positions[idx]
-        pose_name = self.comboBox_lamella_pose.currentText()
         if pose_name == "":
             notification_service.show_toast("No pose selected.", "warning")
             return
         if pose_name not in lamella.poses:
-            notification_service.show_toast(f"Pose '{pose_name}' not found for {lamella.name}.", "warning")
+            notification_service.show_toast(
+                f"Pose '{pose_name}' not found for {lamella.name}.", "warning"
+            )
             return
         pose = lamella.poses[pose_name]
         if pose.stage_position is None:
-            notification_service.show_toast(f"Pose '{pose_name}' has no stage position.", "warning")
+            notification_service.show_toast(
+                f"Pose '{pose_name}' has no stage position.", "warning"
+            )
             return
 
         # confirmation dialog
@@ -1652,7 +1523,85 @@ class AutoLamellaUI(QMainWindow):
 
         logging.info(f"Moving to pose '{pose_name}' for {lamella.name}.")
         self.movement_widget.move_to_position(pose.stage_position)
-        notification_service.show_toast(f"Moved to pose '{pose_name}' for {lamella.name}.", "info")
+        notification_service.show_toast(
+            f"Moved to pose '{pose_name}' for {lamella.name}.", "info"
+        )
+
+    def _use_current_objective_position(self):
+        """Read the current FM objective position and apply it to the selected lamella."""
+        if self.microscope is None or self.microscope.fm is None:
+            notification_service.show_toast("No microscope connected.", "warning")
+            return
+        lamella = self.get_selected_lamella()
+        if lamella is None or lamella.fluorescence_pose is None:
+            notification_service.show_toast("No lamella selected.", "warning")
+            return
+        obj = self.microscope.fm.objective
+        if obj.state == "Inserted":
+            value_m = obj.position
+        else:
+            value_m = obj.focus_position
+        if value_m is None:
+            notification_service.show_toast("Objective position unavailable.", "warning")
+            return
+        lamella.fluorescence_pose.objective_position = value_m
+        self.experiment.save()
+        # full refresh so the objective value shows and "Apply to All" re-enables
+        self.selected_lamella_widget.set_lamella(lamella)
+        notification_service.show_toast(
+            f"Set objective position to {value_m * METRE_TO_MICRON:.1f} µm for {lamella.name}.", "info"
+        )
+
+    def _move_objective_to_lamella_position(self):
+        """Move the FM objective to the selected lamella's stored objective position.
+
+        Independent of the stage move-to: this only drives the objective.
+        """
+        if self.microscope is None or self.microscope.fm is None:
+            notification_service.show_toast("No microscope connected.", "warning")
+            return
+        lamella = self.get_selected_lamella()
+        if lamella is None or lamella.fluorescence_pose is None:
+            notification_service.show_toast("No lamella selected.", "warning")
+            return
+        objective_position = lamella.fluorescence_pose.objective_position
+        if objective_position is None:
+            notification_service.show_toast(
+                f"{lamella.name} has no stored objective position.", "warning"
+            )
+            return
+        obj = self.microscope.fm.objective
+        if obj.state != "Inserted":
+            notification_service.show_toast(
+                "Insert the objective before moving to a stored position.", "warning"
+            )
+            return
+
+        # confirmation dialog
+        ret = QMessageBox.question(
+            self,
+            "Move Objective",
+            f"Move objective to {objective_position * METRE_TO_MICRON:.1f} µm "
+            f"for {lamella.name}?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        try:
+            logging.info(
+                f"Moving objective to {objective_position * METRE_TO_MICRON:.1f} µm "
+                f"for {lamella.name}."
+            )
+            obj.move_absolute(objective_position)
+            notification_service.show_toast(
+                f"Moved objective to {objective_position * METRE_TO_MICRON:.1f} µm "
+                f"for {lamella.name}.",
+                "info",
+            )
+        except Exception as e:
+            logging.error(f"Failed to move objective: {e}", exc_info=e)
+            notification_service.show_toast(f"Failed to move objective: {e}", "warning")
 
     def update_lamella_objective_position(self, value: float):
         """Update the objective position of the current lamella."""
@@ -1664,9 +1613,28 @@ class AutoLamellaUI(QMainWindow):
             return
 
         lamella = self.experiment.positions[idx]
-        # convert from mm to m
-        lamella.objective_position = value * 1e-3
+        if lamella.fluorescence_pose is None:
+            return
+        # convert from µm to m
+        lamella.fluorescence_pose.objective_position = value * MICRON_TO_METRE
         self.experiment.save()
+
+    def _apply_objective_position_to_all(self):
+        """Copy the current spinbox objective position to all lamella that have a fluorescence pose."""
+        if self.experiment is None:
+            return
+        value_um = self.selected_lamella_widget.objective_value_um()
+        value_m = value_um * MICRON_TO_METRE
+        count = 0
+        for lamella in self.experiment.positions:
+            if lamella.fluorescence_pose is not None:
+                lamella.fluorescence_pose.objective_position = value_m
+                count += 1
+        if count:
+            self.experiment.save()
+            notification_service.show_toast(
+                f"Applied objective position ({value_um:.1f} µm) to {count} lamella.", "info"
+            )
 
     def get_selected_lamella(self) -> Optional[Lamella]:
         """Get the currently selected lamella from the combobox.
@@ -1690,11 +1658,15 @@ class AutoLamellaUI(QMainWindow):
     def load_protocol(self):
         """Load a protocol into the current experiment using the protocol loading dialog."""
         if self.microscope is None:
-            notification_service.show_toast("Please connect to microscope first.", "warning")
+            notification_service.show_toast(
+                "Please connect to microscope first.", "warning"
+            )
             return
 
         if self.experiment is None:
-            notification_service.show_toast("Please load an experiment first.", "warning")
+            notification_service.show_toast(
+                "Please load an experiment first.", "warning"
+            )
             return
 
         # Open the protocol loading dialog
@@ -1736,7 +1708,9 @@ class AutoLamellaUI(QMainWindow):
             return
 
         self.experiment.task_protocol.save(protocol_path)
-        notification_service.show_toast(f"Saved Protocol to {os.path.basename(protocol_path)}", "info")
+        notification_service.show_toast(
+            f"Saved Protocol to {os.path.basename(protocol_path)}", "info"
+        )
 
     #########
     def cryo_deposition(self):
@@ -1767,7 +1741,7 @@ class AutoLamellaUI(QMainWindow):
         self.pushButton_no.setEnabled(neg is not None)
         self.pushButton_no.setVisible(neg is not None)
 
-        if pos == "Run Milling":
+        if pos in ("Run Milling", "Run Spot Burn"):
             self.pushButton_yes.setStyleSheet(
                 stylesheets.SUPERVISION_STATUS_AUTOMATED_STYLESHEET
             )
@@ -1808,6 +1782,8 @@ class AutoLamellaUI(QMainWindow):
             self._workflow_stop_event.set()
         if self.milling_task_config_widget is not None:
             self.milling_task_config_widget.milling_widget.stop_milling()
+        if self.spot_burn_widget is not None:
+            self.spot_burn_widget.cancel_spot_burn()
 
     def _workflow_finished(self):
         """Handle the completion of the workflow."""
@@ -1821,7 +1797,7 @@ class AutoLamellaUI(QMainWindow):
 
         self._workflow_stop_event.clear()
         self.tabWidget.setCurrentIndex(self.tabWidget.indexOf(self.tab))
-        self.pushButton_stop_workflow.setVisible(False)
+
         self.WAITING_FOR_USER_INTERACTION = False
 
         # clear milling task config
@@ -1830,6 +1806,13 @@ class AutoLamellaUI(QMainWindow):
             self.milling_task_config_widget.milling_widget.pushButton_run_milling.setVisible(
                 True
             )
+
+        # restore the spot burn widget: an aborted workflow skips the clear_spot_burn
+        # message that normally resets it, which would leave the Burn button hidden
+        # (no-op after a normal completion, where clear_spot_burn already ran)
+        if self.spot_burn_widget is not None:
+            self.spot_burn_widget.set_workflow_mode(False)
+            self.spot_burn_widget.clear_points_layer()
 
         # clear detection layers
         if self.det_widget is not None:
@@ -1850,6 +1833,21 @@ class AutoLamellaUI(QMainWindow):
         self.image_widget.restore_active_layer_for_movement()
 
         self.set_current_workflow_message(msg=None, show=False)
+
+        # show the post-workflow summary of tasks run this session
+        self._show_workflow_summary()
+
+    def _show_workflow_summary(self) -> None:
+        """Show a modal summary dialog of the tasks run in the last workflow."""
+        summary = self._last_run_summary
+        self._last_run_summary = None
+        if summary is None or summary.empty:
+            return
+        try:
+            dialog = WorkflowSummaryDialog(summary, parent=self)
+            dialog.exec_()
+        except Exception as e:
+            logging.warning(f"Failed to show workflow summary dialog: {e}")
 
     def handle_workflow_update(self, info: dict) -> None:
         """Update the UI with the given information, ready for user interaction"""
@@ -1918,11 +1916,15 @@ class AutoLamellaUI(QMainWindow):
         spot_burn = info.get("spot_burn", None)
         if spot_burn:
             self.set_spot_burn_widget_active(True)
+            if self.spot_burn_widget is not None:
+                # hide the widget's own Burn button; the burn is run from the workflow control
+                self.spot_burn_widget.set_workflow_mode(True)
         spot_burn_parameters = info.get("spot_burn_parameters", None)
         if spot_burn_parameters is not None and self.spot_burn_widget is not None:
             self.spot_burn_widget.update_parameters(spot_burn_parameters)
         if info.get("clear_spot_burn", False) and self.spot_burn_widget is not None:
             self.spot_burn_widget.clear_points_layer()
+            self.spot_burn_widget.set_workflow_mode(False)
 
         milling_config = info.get("milling_config", None)
         if milling_config is not None:
@@ -1931,6 +1933,12 @@ class AutoLamellaUI(QMainWindow):
             self.tabWidget.setCurrentWidget(self.milling_task_config_widget)
         if info.get("clear_milling_config", False):
             self.milling_task_config_widget.clear()
+        # fluorescence channel settings
+        fluorescence_channel_settings = info.get("fluorescence_channel_settings", None)
+        if fluorescence_channel_settings is not None and self.fm_control_widget:
+            self.fm_control_widget.channelSettingsWidget.channel_settings = (
+                fluorescence_channel_settings
+            )
 
         # instruction message
         self.set_instructions_msg(

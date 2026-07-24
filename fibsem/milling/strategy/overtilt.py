@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
-import os
+import threading
 from dataclasses import dataclass, field
+from typing import Optional
+
 import numpy as np
 
-from fibsem import acquire, alignment
+from fibsem import acquire, alignment, config as fcfg
+from fibsem.cancellation import raise_if_cancelled
 from fibsem.microscope import FibsemMicroscope
 from fibsem.milling import setup_milling
 from fibsem.milling.base import (
@@ -79,6 +82,7 @@ class OvertiltTrenchMillingStrategy(MillingStrategy[OvertiltTrenchMillingConfig]
         stage: "FibsemMillingStage",
         asynch: bool = False,
         parent_ui=None,
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
         """Mill a trench pattern with overtilt,
         based on https://www.sciencedirect.com/science/article/abs/pii/S1047847716301514 and autolamella v1"""
@@ -92,6 +96,13 @@ class OvertiltTrenchMillingStrategy(MillingStrategy[OvertiltTrenchMillingConfig]
         initial_position = microscope.get_stage_position()
         overtilt_in_radians = np.deg2rad(self.config.overtilt)
 
+        # route the reference image + alignment output to the stage's configured
+        # imaging path (falling back to DATA_CC_PATH), mirroring
+        # milling.core.get_stage_reference_image — never the current working dir.
+        alignment_path = stage.imaging.path
+        if alignment_path is None:
+            alignment_path = fcfg.DATA_CC_PATH
+
         # TODO: pass in image settings
         # TODO: attach image_settings to microscope? or get current settings?
         # TODO: use drift correction structure to re-align? once added to milling stage
@@ -102,7 +113,7 @@ class OvertiltTrenchMillingStrategy(MillingStrategy[OvertiltTrenchMillingConfig]
             beam_type=stage.milling.milling_channel,
         )
         image_settings.reduced_area = stage.alignment.rect
-        image_settings.path = os.getcwd()
+        image_settings.path = alignment_path
         image_settings.filename = f"ref_{stage.name}_overtilt_alignment"
         ref_image = acquire.acquire_image(microscope, image_settings)
 
@@ -123,20 +134,24 @@ class OvertiltTrenchMillingStrategy(MillingStrategy[OvertiltTrenchMillingConfig]
             image_settings = ImageSettings.fromFibsemImage(ref_image)
             image_settings.filename = f"{stage.name}_overtilt_alignment_target_{i}"
 
+            # ref_image carries alignment_path, so multi_step_alignment_v2's
+            # default save path resolves under <alignment_path>/Alignment/,
+            # mirroring setup_milling's drift-correction alignment.
             alignment.multi_step_alignment_v2(
                 microscope=microscope,
                 ref_image=ref_image,
-                beam_type=stage.milling.milling_channel,
-                alignment_current=None,
                 steps=3,
+                run_name=f"{stage.name}_overtilt_alignment_{i}",
+                stop_event=stop_event,  # abort between alignment steps
             )
 
             # setup again to ensure we are milling at the correct current, cleared patterns
-            setup_milling(microscope=microscope, milling_stage=stage)
+            setup_milling(microscope=microscope, milling_stage=stage, stop_event=stop_event)
 
             # draw pattern
             microscope.draw_pattern(pattern=pattern)
 
+            raise_if_cancelled(stop_event)  # last chance before the beam starts
             # run milling
             microscope.run_milling(
                 milling_current=stage.milling.milling_current,

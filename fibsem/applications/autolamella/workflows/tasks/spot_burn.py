@@ -1,18 +1,25 @@
 
 ######## SPOT BURN FIDUCIAL TASK DEFINITIONS ########
+from __future__ import annotations
 
+import logging
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal, Optional, Type
+from typing import ClassVar, Optional, Type
 
 from fibsem import config as fcfg
 from fibsem.applications.autolamella.structures import AutoLamellaTaskConfig
-from fibsem.applications.autolamella.workflows.tasks.base import AutoLamellaTask
+from fibsem.applications.autolamella.workflows.tasks.base import (
+    ALIGNMENT_REFERENCE_IMAGE_FILENAME,
+    AutoLamellaTask,
+)
 from fibsem.applications.autolamella.workflows.ui import (
     ask_user,
     clear_spot_burn_ui,
     update_spot_burn_parameters,
 )
+from fibsem.structures import BeamType, Point
 
 
 @dataclass
@@ -36,11 +43,42 @@ class SpotBurnFiducialTaskConfig(AutoLamellaTaskConfig):
             'scale': 1
         }
     )
-    orientation: Literal["SEM", "FIB", "FM", "MILLING", None] = field(
-        default="MILLING",
-        metadata={"help": "The orientation to perform spot burning in", "items": ("SEM", "FIB", "MILLING")},
+    coordinates: list[Point] = field(
+        default_factory=list,
+        metadata={"help": "Spot burn positions in normalised image coordinates (0-1)"},
     )
 
+    @property
+    def parameters(self) -> tuple[str, ...]:
+        return tuple(p for p in super().parameters if p != "coordinates")
+
+    def to_dict(self) -> dict:
+        ddict = {}
+        ddict["task_type"] = self.task_type
+        ddict["parameters"] = {
+            "milling_current": self.milling_current,
+            "exposure_time": self.exposure_time,
+        }
+        ddict["milling"] = {k: v.to_dict() for k, v in self.milling.items()}
+        if self.reference_imaging is not None:
+            ddict["reference_imaging"] = self.reference_imaging.to_dict()
+        ddict["coordinates"] = [pt.to_dict() for pt in self.coordinates]
+        return ddict
+
+    @classmethod
+    def from_dict(cls, ddict: dict) -> 'SpotBurnFiducialTaskConfig':
+        cfg = AutoLamellaTaskConfig.from_dict(ddict)
+        params = ddict.get("parameters", {})
+        coordinates = [Point.from_dict(pt) for pt in ddict.get("coordinates", [])]
+        return cls(
+            task_name=cfg.task_name,
+            milling=cfg.milling,
+            reference_imaging=cfg.reference_imaging,
+            # coerce numeric params: older protocols may have stored these as strings
+            milling_current=float(params.get("milling_current", 60.0e-12)),
+            exposure_time=int(float(params.get("exposure_time", 10))),
+            coordinates=coordinates,
+        )
 
 class SpotBurnFiducialTask(AutoLamellaTask):
     """Task to mill spot fiducial markers for correlation."""
@@ -53,32 +91,82 @@ class SpotBurnFiducialTask(AutoLamellaTask):
         image_settings = self.config.imaging
         image_settings.path = self.lamella.path
 
-        # move to the target position at the FIB orientation
-        self.log_status_message("MOVE_TO_SPOT_BURN", "Moving to Spot Burn Position...")
-        stage_position = self.lamella.stage_position
-        target_position = self._get_stage_position_for_orientation(stage_position,
-                                                                   self.config.orientation)
-        self.microscope.safe_absolute_stage_movement(target_position)
+        # restore the full milling-pose state, then align to the stored reference so
+        # the burn coordinates land on target (mirrors rough/polishing)
+        self._move_to_milling_pose()
+        self._align_reference_image(ALIGNMENT_REFERENCE_IMAGE_FILENAME)
+
+        self.config.exposure_time = float(self.config.exposure_time)
 
         # acquire images, set ui
-        self._acquire_reference_image(image_settings, field_of_view=fcfg.REFERENCE_HFW_HIGH)
+        self._acquire_reference_image(image_settings, field_of_view=self.config.reference_imaging.field_of_view1)
 
+        self.log_status_message("SPOT_BURN_FIDUCIAL", "Running Spot Burn...")
 
-        # update the spot burn parameters in the UI # TODO: allow user to store spot positions?
-        params = deepcopy({"milling_current": self.config.milling_current,
-                           "exposure_time": self.config.exposure_time})
-        self.update_spot_burn_parameters_ui(params)
+        # update the spot burn parameters in the UI
+        self.update_spot_burn_parameters_ui()
 
         # acquire final reference images
         self._acquire_set_of_reference_images(image_settings)
 
-    def update_spot_burn_parameters_ui(self, parameters: dict):
-        """Update the spot burn parameters in the UI."""
+    def update_spot_burn_parameters_ui(self):
+        """Run the spot burn automatically (unsupervised/headless), or hand off to the UI.
+
+        Supervised runs let the user place/adjust points and run the burn in the spot
+        burn widget; unsupervised/headless runs burn the stored coordinates directly.
+        """
+        # automatic path: no user in the loop (unsupervised or headless)
+        if not self.validate or self.parent_ui is None:
+            if not self.config.coordinates:
+                logging.warning(
+                    f"No spot burn coordinates set for {self.lamella.name}; skipping spot burn."
+                )
+                return
+            from fibsem.imaging.spot import run_spot_burn
+            run_spot_burn(microscope=self.microscope,
+                          coordinates=self.config.coordinates,
+                          exposure_time=self.config.exposure_time,
+                          milling_current=self.config.milling_current,
+                          beam_type=BeamType.ION,
+                          stop_event=self._stop_event)
+            return
+
+        # supervised path: task-orchestrated run/wait/re-prompt loop (mirrors milling).
+        # The user runs the burn via the workflow "Run Spot Burn" button; the task waits
+        # for each burn to finish before continuing so the workflow can't advance mid-burn.
+        if self.parent_ui.spot_burn_widget is None:
+            logging.warning("Spot burn widget not available in UI.")
+            return
+
+        parameters = deepcopy({"milling_current": self.config.milling_current,
+                    "exposure_time": self.config.exposure_time,
+                    "coordinates": self.config.coordinates})
         update_spot_burn_parameters(parent_ui=self.parent_ui, parameters=parameters)
 
-        # ask the user to select the position/parameters for spot burns
-        msg = f"Run the spot burn workflow for {self.lamella.name}. Press continue when finished."
-        ask_user(self.parent_ui, msg=msg, pos="Continue", spot_burn=True)
+        spot_burn_widget = self.parent_ui.spot_burn_widget
+        msg = f"Place points and run the spot burn for {self.lamella.name}. Press Continue when finished."
+        response = ask_user(self.parent_ui, msg=msg, pos="Run Spot Burn", neg="Continue", spot_burn=True)
+        while response:
+            self.update_status_ui("Running Spot Burn...")
+            spot_burn_widget.start_spot_burn_signal.emit()
+            # BlockingQueuedConnection: on return from emit the burn is either running
+            # (is_burning=True) or was refused (no in-bounds points), in which case the
+            # wait loop exits immediately and the user is re-prompted.
+            try:
+                while spot_burn_widget.is_burning:
+                    self._check_for_abort()
+                    time.sleep(1)
+            except InterruptedError:
+                # workflow stopped: take the burn down with the task. Covers the race
+                # where the burn starts after the Stop click already ran cancel (the
+                # worker clears its stop_event on start). cancel_spot_burn only sets
+                # a threading.Event, so it is safe to call from the task thread.
+                spot_burn_widget.cancel_spot_burn()
+                raise
+            response = ask_user(self.parent_ui, msg=msg, pos="Run Spot Burn", neg="Continue", spot_burn=True)
+
+        # store the coordinates from the UI back to the config
+        self.config.coordinates = spot_burn_widget.get_coordinates()
 
         # clear the spot burn parameters from the UI
         clear_spot_burn_ui(self.parent_ui)

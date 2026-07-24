@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import sys
 from typing import TYPE_CHECKING, Optional, Union
+from fibsem.microscopes._stage import SampleGridLoader, SampleHolder, Stage
 
 if TYPE_CHECKING:
+    from fibsem.microscope import ThermoMicroscope
     from fibsem.structures import (
         BeamType,
         FibsemImage,
@@ -278,3 +280,140 @@ def fibsem_image_from_adorned_image(
         microscope_state=state,
     )
     return FibsemImage(data=adorned.data, metadata=metadata)
+
+
+class AutoscriptManipulator:
+    """Manipulator interface for AutoScript-based microscopes."""
+
+    def __init__(
+        self,
+        parent: "ThermoMicroscope",
+    ) -> None:
+        self.parent = parent
+
+    def __repr__(self) -> str:
+        return f"<Manipulator: position={self.position}>"
+
+    @property
+    def position(self) -> FibsemManipulatorPosition:
+        return self.parent.get_manipulator_position()
+
+    def insert(self) -> None:
+        """Insert the manipulator."""
+        self.parent.insert_manipulator()
+
+    def retract(self) -> None:
+        """Retract the manipulator."""
+        self.parent.retract_manipulator()
+
+    def move_absolute(self, position: FibsemManipulatorPosition) -> FibsemManipulatorPosition:
+        pass
+
+    def move_relative(self, position: FibsemManipulatorPosition) -> FibsemManipulatorPosition:
+        pass
+
+    def move_corrected(self, dx: float, dy: float, beam_type: BeamType) -> FibsemManipulatorPosition:
+        pass
+
+
+class AutoscriptStage(Stage):
+    """Stage interface for AutoScript-based microscopes."""
+
+    def __init__(
+        self,
+        parent: "ThermoMicroscope",
+        holder: SampleHolder,
+        loader: Optional["SampleGridLoader"] = None,
+    ) -> None:
+        super().__init__(parent, holder, loader)
+
+
+class AutoscriptCompustage(Stage):
+    """Compustage interface for AutoScript-based microscopes."""
+
+    def __init__(
+        self,
+        parent: "ThermoMicroscope",
+        holder: SampleHolder,
+        loader: Optional["SampleGridLoader"] = None,
+    ) -> None:
+        super().__init__(parent, holder, loader)
+
+
+class AutoscriptSputterCoater:
+    pass
+
+
+
+from typing import TYPE_CHECKING
+import time 
+if TYPE_CHECKING:
+    from fibsem.microscope import ThermoMicroscope
+from fibsem.structures import FibsemStagePosition
+
+class AutoscriptGISPort:
+    port_name: str = "Pt dep"
+    zlimit: float = 4.0e-3 # RAW_COORDINATES
+
+    def __init__(self, parent: 'ThermoMicroscope'):
+        self.parent = parent
+
+        available_ports = self.parent.connection.gas.list_all_gis_ports()
+
+        print(f"available gis ports: {available_ports}")
+        self._port = self.parent.connection.gas.get_gis_port(self.port_name)
+
+    def insert(self):
+
+        self._run_safety_check()
+
+        self._port.insert()
+
+    def retract(self):
+        self._port.retract()
+
+    def _move_to_safe_gis_position(self):
+
+        self.parent.move_stage_absolute(FibsemStagePosition(z=self.zlimit-500e-6))
+
+    def _run_safety_check(self):
+
+        stage_position = self.parent.get_stage_position()
+        if stage_position.z > self.zlimit:
+            raise ValueError(f"Unable to insert gis at current z-position{stage_position.pretty}, {self.zlimit*1e3}mm")
+
+    def open(self):
+        self._port.open()
+
+    def close(self):
+        self._port.close()
+
+    @property
+    def temperature(self) -> float:
+        return self._port.get_temperature()
+
+    def turn_heater_on(self, target_temp: float = 300, timeout: float = 15):
+        self._port.turn_heater_on(target_temp, timeout)
+
+    def turn_heater_off(self):
+        self._port.turn_heater_off()
+
+    def run_deposition(self, duration: int) -> None:
+
+        self.insert()
+
+        # QUERY: acquire diagnostic sem image?
+
+        self.open()
+
+        remaining_time = duration
+        while True:
+            print(f"Depositing: {self.port_name} - {remaining_time}s")
+            time.sleep(1)
+            remaining_time -= 1
+
+            if remaining_time <= 0:
+                break
+
+        self.close()
+        self.retract()
